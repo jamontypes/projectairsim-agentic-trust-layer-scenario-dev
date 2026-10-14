@@ -1,0 +1,82 @@
+{
+  "id": "SceneTenDrones",
+  "actors": [
+    {
+      "type": "robot",
+      "name": "Drone1",
+      "origin": {"xyz": "-1.5 -1.5 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone2",
+      "origin": {"xyz": "-1.5 1.5 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone3",
+      "origin": {"xyz": "1.5 -1.5 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone4",
+      "origin": {"xyz": "1.5 1.5 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone5",
+      "origin": {"xyz": "-4.0 0.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone6",
+      "origin": {"xyz": "-3.0 3.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone7",
+      "origin": {"xyz": "0.0 4.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone8",
+      "origin": {"xyz": "3.0 3.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone9",
+      "origin": {"xyz": "4.0 0.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone10",
+      "origin": {"xyz": "0.0 -4.0 -4.0", "rpy-deg": "0 0 0"},
+      "robot-config": "robot_quadrotor_fastphysics.jsonc"
+    }
+  ],
+  "clock": {
+    "type": "steppable",
+    "step-ns": 3000000,
+    "real-time-update-rate": 3000000,
+    "pause-on-start": false
+  },
+  "home-geo-point": {
+    "latitude": 47.641468,
+    "longitude": -122.140165,
+    "altitude": 122.0
+  },
+  "segmentation": {
+    "initialize-ids": true,
+    "ignore-existing": false,
+    "use-owner-name": true
+  },
+  "scene-type": "UnrealNative"
+}
