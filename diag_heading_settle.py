@@ -1,7 +1,7 @@
 """
 Diagnostic: does Simple Flight settle after move_to_position at every heading?
 
-    python .\\diag_heading_settle.py [--headings 315,45,0] [--modes rate,hold]
+    python .\\diag_heading_settle.py [--headings 315,45,0] [--modes rate,velocity]
 
 Why: in the first live LLM run (scene_basic_drone.jsonc, drone spawned at heading
 315), a 10 m move north overshot and then ORBITED the target in a slowly decaying
@@ -13,8 +13,12 @@ Result of the first diag run: 315 and 45 timed out orbiting, 0 and 90 settled.
 Candidate fix: move_to_position's default yaw is "hold yaw RATE 0" (the heading
 drifted 315 -> 318 while orbiting); ExecutorConfig.move_hold_heading=True commands
 the start heading explicitly instead. --modes compares them:
-    rate  Project AirSim default (yaw_is_rate=True, yaw=0)
-    hold  yaw_is_rate=False, yaw=heading at command start
+    rate      Project AirSim default (yaw_is_rate=True, yaw=0)
+    hold      yaw_is_rate=False, yaw=heading at command start
+              (diag 2: no difference; 315/45 still orbit)
+    velocity  ExecutorConfig.final_approach="velocity": after the move task ends,
+              the executor commands velocity toward the target (v = 0.8/s * error,
+              max 1 m/s) until settled, then hovers
 
 No LLM. For each mode and heading: rotate to it, fly 10 m (alternately north and
 back) at 3 m/s with the executor, then watch 10 s more and measure the residual
@@ -92,7 +96,8 @@ async def main(args) -> int:
                 legs = [(m, h) for m in modes for h in headings]
                 for i, (mode, h) in enumerate(legs):
                     ex = ProjectAirSimExecutor(adapter, on_event=on_event, config=replace(
-                        ExecutorConfig(), move_hold_heading=(mode == "hold")))
+                        ExecutorConfig(), move_hold_heading=(mode == "hold"),
+                        final_approach="velocity" if mode == "velocity" else "none"))
                     r = await ex.rotate_to_heading(VEHICLE, h % 360.0, reason=f"diag: face {h:g}")
                     print(f"\n[{mode}] heading {h:g}: rotate {r.status.value}")
                     n = home_n + (LEG_M if i % 2 == 0 else 0.0)
@@ -127,5 +132,5 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="scene_basic_drone.jsonc")
     ap.add_argument("--headings", default="315,45,0")
-    ap.add_argument("--modes", default="rate,hold")
+    ap.add_argument("--modes", default="rate,velocity")
     sys.exit(asyncio.run(main(ap.parse_args())))

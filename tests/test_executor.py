@@ -97,6 +97,15 @@ class FakeDrone:
     async def hover_async(self):
         return await self._command("hover", lambda: None)
 
+    async def move_by_velocity_async(self, v_north, v_east, v_down, duration=0.001, **yaw):
+        self.velocities = getattr(self, "velocities", []) + [(v_north, v_east, v_down)]
+        w = self.world
+
+        def apply():
+            w.target_ne = (w.n + v_north * duration, w.e + v_east * duration)
+            w.target_alt = w.alt - v_down * duration
+        return await self._command("move_by_velocity", apply)
+
 
 class FakeAdapter:
     def __init__(self, world, drone):
@@ -606,3 +615,54 @@ def test_move_heading_hold_option_sends_the_start_heading(hold):
         assert drone.last_move_yaw["yaw"] == pytest.approx(math.radians(-45.0))
     else:
         assert drone.last_move_yaw == {}
+
+
+# ------------------------------------------------------------ velocity final approach
+def velocity_executor(world=None):
+    from dataclasses import replace
+    world, drone, ex = setup()
+    ex.config = replace(ex.config, final_approach="velocity", settle_timeout_s=2.0)
+    return world, drone, ex
+
+
+def test_velocity_final_approach_closes_an_overshoot_without_corrections():
+    world, drone, ex = velocity_executor()
+    world.misses = [(-1.8, 1.4, 0.0)]                 # simulator's move ends 2.3 m off
+    r = run(ex.execute(move(0.0, -3.0, 6.0, speed=3.0)))
+    assert r.status == CommandStatus.SUCCEEDED, r.reason
+    assert r.corrections == 0 and drone.calls[0] == "move_to_position"
+    assert "move_by_velocity" in drone.calls and drone.calls[-1] == "hover"
+    vn, ve, _ = drone.velocities[0]                   # first command points back at the target
+    assert vn > 0 and ve < 0 and math.hypot(vn, ve) <= ex.config.approach_max_speed_mps + 1e-9
+    assert math.hypot(world.n - 0.0, world.e + 3.0) <= ex.config.position.max_error_m
+
+
+def test_velocity_final_approach_is_not_used_when_already_settled():
+    world, drone, ex = velocity_executor()
+    r = run(ex.execute(move(0.0, -3.0, 6.0)))
+    assert r.status == CommandStatus.SUCCEEDED
+    assert drone.calls == ["move_to_position"]
+
+
+def test_velocity_final_approach_holds_the_altitude_commands_hold_point():
+    world, drone, ex = velocity_executor()
+    world.misses = [(1.5, 0.0, 0.0)]                  # an altitude move that drifted north
+    start_n, start_e = world.n, world.e
+    r = run(ex.execute(climb(7.0)))
+    assert r.status == CommandStatus.SUCCEEDED, r.reason
+    assert world.n == pytest.approx(start_n, abs=0.5) and world.e == pytest.approx(start_e, abs=0.5)
+
+
+def test_velocity_final_approach_times_out_and_hovers():
+    world, drone, ex = velocity_executor()
+    world.misses = [(3.0, 0.0, 0.0)]
+    world_stuck_after_move = world
+    orig = drone.move_by_velocity_async
+
+    async def no_effect(*a, **k):
+        world_stuck_after_move.stuck = True
+        return await orig(*a, **k)
+    drone.move_by_velocity_async = no_effect
+    r = run(ex.execute(move(0.0, -3.0, 6.0)))
+    assert r.status == CommandStatus.TIMED_OUT and r.reason_code == "settle_timeout"
+    assert "velocity final approach" in r.reason and r.fallback_applied == "hover"

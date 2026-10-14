@@ -80,7 +80,18 @@ class ExecutorConfig:
     # yaw=0) only holds yaw RATE, so the nose can drift. Live diag (2026-10-14): at headings
     # 315 / 45 a 10 m move overshot and then orbited the target (~1 m, 0.6-0.7 m/s) without
     # settling; at 0 / 90 it settled. True = command the start heading explicitly.
-    move_hold_heading: bool = False
+    move_hold_heading: bool = False      # diag 2: did NOT fix the orbit; kept for experiments
+    # Final approach for position/altitude commands, after the simulator's move task ends:
+    #   "none"      settle on Simple Flight's own position hold (+ bounded corrections)
+    #   "velocity"  close the loop ourselves: every poll, command a world-frame velocity
+    #               toward the target, v = gain * error (clamped, zero inside the deadband),
+    #               then hover once settled. Replaces the corrections.
+    final_approach: str = "none"
+    approach_gain_per_s: float = 0.8
+    approach_max_speed_mps: float = 1.0
+    approach_max_vertical_mps: float = 0.5
+    approach_deadband_m: float = 0.15
+    approach_cmd_duration_s: float = 0.3     # each command outlives one poll interval
     heading: HeadingTolerance = field(default_factory=HeadingTolerance)
     altitude: AltitudeTolerance = field(default_factory=AltitudeTolerance)
     position: PositionTolerance = field(default_factory=PositionTolerance)
@@ -389,11 +400,28 @@ class ProjectAirSimExecutor:
         stall = DwellTracker(cfg.correction_stall_s)
         deadline = Deadline(cfg.settle_timeout_s, clock=self._clock)
         detail = ""
+        approach = correct_cmd is not None and cfg.final_approach == "velocity"
         while True:
             snap = self._check_telemetry(action, state, "while settling")
             ok, detail = settle(snap, action, start)
             if dwell.update(snap.sim_time_ns, ok):
+                if approach and state.get("approach_cmds"):
+                    state["task"] = await self._send(self._hover_cmd, drone, action)
+                    self._emit("final_approach", action, commands=state["approach_cmds"],
+                               result="settled", sim_time_ns=snap.sim_time_ns)
                 return
+            if approach and (not ok or state.get("approach_cmds")):   # engage once off target
+                state["approach_cmds"] = state.get("approach_cmds", 0) + 1
+                state["task"] = await self._send(self._approach_cmd, drone, action, start, snap)
+                if deadline.expired:
+                    self._emit("final_approach", action, commands=state["approach_cmds"],
+                               result="timed out", sim_time_ns=snap.sim_time_ns)
+                    raise _Abort(CommandStatus.TIMED_OUT,
+                                 f"did not settle within {cfg.settle_timeout_s:.1f} s on velocity "
+                                 f"final approach (held {dwell.held_s:.2f} s; last: {detail})",
+                                 "settle_timeout")
+                await self._sleep(cfg.poll_interval_s)
+                continue
             stopped_off_target = (not ok) and _total_speed(snap) <= cfg.correction_max_speed_mps
             if (correct_cmd is not None and state["corrections"] < cfg.max_corrections
                     and stall.update(snap.sim_time_ns, stopped_off_target)):
@@ -416,6 +444,30 @@ class ProjectAirSimExecutor:
                              + (f" after {n} correction{'s' if n > 1 else ''}" if n else "")
                              + f" (held {dwell.held_s:.2f} s; last: {detail})", "settle_timeout")
             await self._sleep(cfg.poll_interval_s)
+
+    async def _approach_cmd(self, drone, action, start, snap):
+        """One velocity command of the final approach (world frame, toward the target)."""
+        cfg = self.config
+        n, e, alt = _target(action, start)
+        dn, de = n - snap.position_ned_m.x, e - snap.position_ned_m.y
+        dz_up = alt - snap.altitude_local_m
+        dist = math.hypot(dn, de)
+        if dist <= cfg.approach_deadband_m:
+            vn = ve = 0.0
+        else:
+            v = min(cfg.approach_gain_per_s * dist, cfg.approach_max_speed_mps)
+            vn, ve = v * dn / dist, v * de / dist
+        vup = 0.0 if abs(dz_up) <= cfg.approach_deadband_m else max(
+            -cfg.approach_max_vertical_mps,
+            min(cfg.approach_max_vertical_mps, cfg.approach_gain_per_s * dz_up))
+        return await drone.move_by_velocity_async(
+            v_north=vn, v_east=ve, v_down=-vup, duration=cfg.approach_cmd_duration_s,
+            yaw_is_rate=False,
+            yaw=math.radians(((start.heading_deg + 180.0) % 360.0) - 180.0))
+
+    @staticmethod
+    async def _hover_cmd(drone, action):
+        return await drone.hover_async()
 
     def _check_telemetry(self, action, state, when: str) -> TelemetrySnapshot:
         try:
