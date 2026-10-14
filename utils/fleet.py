@@ -61,3 +61,42 @@ async def run_all_or_cancel(coros) -> list:
             raise asyncio.CancelledError()
         raise failed[0].exception()
     return [t.result() for t in tasks]
+
+
+class PhaseBarrier:
+    """All named parties must arrive before any continues (e.g. "nobody descends
+    until every drone has returned").
+
+    wait(party) -> True once everyone has arrived; False if the barrier BROKE
+    because some party departed without arriving (its mission ended early,
+    failed or was cancelled). Every party must call depart(party) when its
+    mission ends for any reason (a `finally:`); after the barrier has tripped,
+    depart() does nothing. This way one failed drone can never leave the others
+    hovering at the barrier forever.
+    """
+
+    def __init__(self, parties, name: str = "sync"):
+        self.name = name
+        self.parties = frozenset(parties)
+        self.arrived: set[str] = set()
+        self.broken_by: str | None = None
+        self._event = asyncio.Event()
+
+    @property
+    def tripped(self) -> bool:
+        return self._event.is_set()
+
+    async def wait(self, party: str) -> bool:
+        if party not in self.parties:
+            raise ValueError(f"{party!r} is not a party to barrier {self.name!r}")
+        if not self._event.is_set():
+            self.arrived.add(party)
+            if self.arrived >= self.parties:
+                self._event.set()
+        await self._event.wait()
+        return self.broken_by is None
+
+    def depart(self, party: str) -> None:
+        if not self._event.is_set():
+            self.broken_by = party
+            self._event.set()

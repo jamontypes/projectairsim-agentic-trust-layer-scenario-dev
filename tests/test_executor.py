@@ -480,9 +480,9 @@ def test_overshoot_then_stopped_is_corrected_once():
 
 
 def test_altitude_error_after_stop_is_corrected_at_original_hold_point():
-    """Live run: Drone2 stopped 0.5 m high."""
+    """Live run: Drone1 stopped ~1 m high (a short descent that never started)."""
     world, drone, ex = setup()
-    world.misses = [(0.0, 0.0, 0.5)]
+    world.misses = [(0.0, 0.0, 0.97)]
     r = run(ex.change_altitude("Drone1", 8.0))
     assert r.status == CommandStatus.SUCCEEDED and r.corrections == 1
     assert drone.last_move[:3] == (-1.0, 8.0, -8.0)

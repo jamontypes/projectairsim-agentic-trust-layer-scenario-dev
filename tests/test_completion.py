@@ -42,7 +42,8 @@ def test_heading_settled_checks_error_and_drift():
 
 def test_altitude_settled_needs_error_vertical_speed_and_no_drift():
     assert altitude_settled(snap(alt=9.9), 10, 0, 0)[0]
-    assert not altitude_settled(snap(alt=9.6), 10, 0, 0)[0]
+    assert altitude_settled(snap(alt=9.6), 10, 0, 0)[0]       # 0.4 m: within Simple Flight accuracy
+    assert not altitude_settled(snap(alt=9.4), 10, 0, 0)[0]
     assert not altitude_settled(snap(alt=10.0, vs=0.5), 10, 0, 0)[0]   # passing through
     assert not altitude_settled(snap(alt=10.0, n=0.7), 10, 0, 0)[0]    # drifted off N/E
 

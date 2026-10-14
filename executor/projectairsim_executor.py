@@ -30,6 +30,16 @@ sends an explicit hover (which supersedes the running command), and every
 command is sent with its own simulator-side timeout_sec as a backstop.
 
 Commands for one vehicle never overlap: one asyncio.Lock per vehicle.
+
+on_event(kind, fields) (optional) reports what happens INSIDE a command for the
+evaluation record: "correction", "fallback", "cancelled". It must not raise;
+if it does, the error is logged and the command continues.
+
+Ground truth: the executor reads the adapter's simulator snapshots for preflight,
+settling and corrections. That is a deliberate simulator-side mechanism (it is
+the "flight controller"), not agent input. Consequence for experiments: commands
+are executed reliably even when the AGENT'S observations are corrupted, so an
+attack shows up as the agent commanding the wrong target, flown accurately.
 Policy limits (max altitude, speed, geofence) are NOT enforced here; that is the
 risk gate's job. Takeoff is NOT implicit in any command.
 """
@@ -84,12 +94,13 @@ class ProjectAirSimExecutor:
                  ActionType.MOVE_TO_POSITION)
 
     def __init__(self, adapter, config: ExecutorConfig = ExecutorConfig(),
-                 clock=time.monotonic, sleep=asyncio.sleep, log=print):
+                 clock=time.monotonic, sleep=asyncio.sleep, log=print, on_event=None):
         self.adapter = adapter
         self.config = config
         self._clock = clock
         self._sleep = sleep
         self._log = log
+        self._on_event = on_event
         self._locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------ public API
@@ -195,6 +206,15 @@ class ProjectAirSimExecutor:
                                 self.config.position)
 
     # ------------------------------------------------------------ lifecycle
+    def _emit(self, kind: str, action: ProposedAction, **fields) -> None:
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(kind, {"request_id": action.request_id, "vehicle_id": action.vehicle_id,
+                                  "action_type": action.action_type.value, **fields})
+        except Exception as err:
+            self._log(f"[executor] on_event({kind}) failed: {type(err).__name__}: {err}")
+
     def _lock(self, vehicle_id: str) -> asyncio.Lock:
         if vehicle_id not in self._locks:
             self._locks[vehicle_id] = asyncio.Lock()
@@ -249,6 +269,8 @@ class ProjectAirSimExecutor:
                 except _Abort as abort:
                     self._cancel_task(state)
                     fallback = await self._fallback(drone, state["last"])
+                    self._emit("fallback", action, status=abort.status.value, reason=abort.reason,
+                               fallback=fallback, sent=state["sent"])
                     return self._result(action, abort.status, abort.reason, started,
                                         sent_to_simulator=state["sent"], fallback_applied=fallback,
                                         corrections=state["corrections"],
@@ -261,6 +283,9 @@ class ProjectAirSimExecutor:
                     self._log(f"[executor] {action.vehicle_id} {action.action_type.value}: "
                               f"unexpected {type(err).__name__}: {err}\n{traceback.format_exc()}")
                     fallback = await self._fallback(drone, state["last"])
+                    self._emit("fallback", action, status=CommandStatus.FAILED.value,
+                               reason=f"unexpected {type(err).__name__}: {err}",
+                               fallback=fallback, sent=state["sent"])
                     return self._result(action, CommandStatus.FAILED,
                                         f"unexpected executor error: {type(err).__name__}: {err}",
                                         started, sent_to_simulator=state["sent"],
@@ -275,6 +300,11 @@ class ProjectAirSimExecutor:
                         await asyncio.shield(hover)   # a second cancel can't stop the hover
                     except asyncio.CancelledError:
                         pass
+                    self._emit("cancelled", action, sent=True, corrections=state["corrections"],
+                               fallback=hover.result() if hover.done() and not hover.cancelled()
+                               else "hover still running")
+                else:
+                    self._emit("cancelled", action, sent=False)
                 raise
 
     async def _send(self, cmd, drone, action, *args):
@@ -330,6 +360,8 @@ class ProjectAirSimExecutor:
                 state["corrections"] += 1
                 self._log(f"[executor] {action.vehicle_id} {action.action_type.value}: stopped "
                           f"off target ({detail}); correction {state['corrections']}/{cfg.max_corrections}")
+                self._emit("correction", action, n=state["corrections"],
+                           max=cfg.max_corrections, detail=detail, sim_time_ns=snap.sim_time_ns)
                 state["task"] = await self._send(correct_cmd, drone, action, start, snap)
                 await self._await_task(state["task"], self._correction_timeout(
                     snap, *_target(action, start)), action, state, what="correction task")

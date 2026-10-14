@@ -6,10 +6,42 @@ An agent proposes drone actions; deterministic layers validate telemetry and
 gate actions before anything reaches the simulator.
 
 ```
-Agent proposal -> Action risk gate -> Executor -> Project AirSim adapter -> Simulator
-                                                        |
-                                    TelemetrySnapshot + validation
+                 Simulator  <-- executor (flight control, ground truth) <--+
+                     |                                                    |
+          adapter (ground truth snapshot)                          action-risk gate
+                     |                                              (BypassGate now)
+      ObservationFeed per drone                                           |
+  strip verdict -> attack hooks -> trust assessor --> Agent --> ActionPort per drone
+                                  (none yet)
+
+  EvaluationRecorder (runs/*.jsonl): every observation, proposal, decision,
+  result, correction, cancellation, shutdown, ground-truth pose and collision
 ```
+
+## Who may see what
+
+| Component | Ground truth | Its own drone's delivered observations | Raw payload | Clean (pre-attack) payload / attack details | Other drones' observations |
+|---|---|---|---|---|---|
+| Agent | No | Yes | Yes | No | No (explicit peer reports later) |
+| Trust / provenance assessor | No | Yes (+ previous one) | Yes | No | No (peer reports later) |
+| Action-risk gate | No | Yes, with its trust assessment | Yes | No | No (peer reports later) |
+| Executor | **Yes** (preflight, settle, corrections) | No | No | No | No |
+| Recorder / separation | Yes | Yes | Yes | Yes | Yes |
+
+The executor deliberately uses simulator ground truth: it plays the role of a
+reliable flight controller. Consequence for experiments: when an agent's
+observations are corrupted, its commands are still flown accurately, so an
+attack shows up as the agent commanding the WRONG target, executed precisely
+(see `test_attack_misleads_the_agent_and_executor_flies_the_wrong_target_accurately`).
+Experiments that attack the flight controller's own sensing would need a
+different executor.
+
+Placeholders are explicit, never silent: with no assessor every observation is
+`not_assessed`, and with no gate every action is `bypassed` (`assessed=false`).
+A run with `bypassed` decisions is an unprotected run, not one where actions
+passed a risk check. Conflict decisions will later need permitted traffic
+information (peer reports) on a modeled channel; the isolated missions here
+don't.
 
 ## Status
 
@@ -24,7 +56,8 @@ Agent proposal -> Action risk gate -> Executor -> Project AirSim adapter -> Simu
 | 5.2 | `move_to_position` with bounded corrections (1.0 m tolerance: Simple Flight stops within ~0.5-0.75 m by design); three-drone scene and concurrent multi-drone flight | done |
 | 5.3 | Pairwise separation + collision assessment; executor catch-all after dispatch; missions cancelled and awaited before shutdown | done |
 | 5.4 | Cancellation survives repeated Ctrl+C and cancels each drone's task once (takeoff included); separation counts only fresh, in-sync samples and reports INCONCLUSIVE on poor coverage | done |
-| 5.5+ | Observation feed, vehicle-bound action port, evaluation recorder; `move_along_track`, `takeoff`, `land` | next |
+| 5.5 | Observation feed (verdict stripped, attack hooks before assessment, receiver-stamped ids), vehicle-bound action port (ownership, observation linkage, no replays, explicit gate bypass), JSONL evaluation recorder written during the run; three-drone demo runs through agents, with a sync point before descending; agents capture home on the ground before takeoff; altitude tolerance 0.5 m (Simple Flight accuracy) | done |
+| 5.6+ | Trust assessor, action-risk gate, attack scenarios; `move_along_track`, `takeoff`, `land` | next |
 
 ## Setup (Windows)
 
@@ -55,7 +88,8 @@ All commands from the repo root.
 | `python test_navigation.py` | yes | Takeoff, rotate nose, move along tracks, return, land |
 | `python test_adapter_live.py [--fly]` | yes | Snapshots at 2 Hz, optionally during a flight |
 | `python test_executor_live.py` | yes | Executor: takeoff (setup), rotate +90 deg, climb 2 m, safe shutdown |
-| `python test_multi_drone_live.py` | yes | Three drones (scene_three_drones.jsonc): climb to separate layers, fan out, turn, return, land, all concurrently; PASS also requires >= 2 m separation between every pair, no drone-to-drone collisions or impacts, and adequate telemetry coverage (otherwise the separation verdict is INCONCLUSIVE, which fails the run) |
+| `python test_multi_drone_live.py` | yes | Three drones (scene_three_drones.jsonc), each flown by a scripted agent through its own feed and port: climb to separate layers, fan out, turn, return, (wait for all) descend, land. Writes `runs/run_<id>.jsonl`. PASS also requires >= 2 m separation between every pair, no drone-to-drone collisions or impacts, and adequate telemetry coverage (otherwise the separation verdict is INCONCLUSIVE, which fails the run) |
+| `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone chain observation -> proposal -> gate decision -> result, shutdowns, separation; works on incomplete runs |
 | `python telemetry_explorer.py` | yes | Dumps every non-camera topic to `telemetry_dump.json` |
 
 Every script that arms the drone calls `utils.flight_safety.safe_shutdown()`
@@ -95,7 +129,16 @@ executor/projectairsim_executor.py  command lifecycle: preflight -> dispatch -> 
 validation/telemetry_validator.py   deterministic data-quality checks
 utils/flight_safety.py              fail-safe shutdown for armed-flight scripts
 utils/separation.py                 pairwise separation + collision assessment (evaluation side, ground truth); PASS / FAIL / INCONCLUSIVE
-utils/fleet.py                      run one coroutine per drone; on any failure cancel + await the rest before shutdown
+utils/fleet.py                      run one coroutine per drone (cancel + await the rest on failure); PhaseBarrier
+models/observation.py               Observation, TrustAssessment, GateDecision
+channel/observation_feed.py         per-drone observation channel (the agent's only input)
+channel/attacks.py                  in-transit attack hooks (offset, replay, drop)
+channel/action_port.py              per-drone action port (the agent's only output)
+trust/assessor.py                   trust assessor interface + NoTrustAssessor placeholder
+gate/action_gate.py                 action-risk gate interface + BypassGate placeholder
+agent/scripted_agent.py             ScriptedMissionAgent (fixed steps, no decision logic)
+evaluation/recorder.py              JSONL run log written during the run; read_run()
+evaluation/summarize_run.py         readable run summary
 sim_config/                         scene + robot configs
 tests/                              offline tests with a fake projectairsim module
 ```

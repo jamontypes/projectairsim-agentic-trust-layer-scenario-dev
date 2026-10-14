@@ -30,7 +30,12 @@ class HeadingTolerance:
 
 @dataclass(frozen=True)
 class AltitudeTolerance:
-    max_error_m: float = 0.3
+    # 0.5 m = Simple Flight's GetDistanceAccuracy() (see PositionTolerance).
+    # change_altitude is a move_to_position, so it inherits the same stopping
+    # behavior. Live Pass 5.5: a ~1 m descent did not move at all (the end was
+    # already inside the lookahead), and the slow correction then stopped
+    # 0.38 m short; a second correction did nothing. 0.3 m could never pass.
+    max_error_m: float = 0.5
     max_vertical_speed_mps: float = 0.2
     max_drift_m: float = 0.5
     dwell_s: float = 0.75
