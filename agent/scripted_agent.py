@@ -5,6 +5,9 @@ It exists to prove the plumbing with flights we already know work. It holds only
 its own ObservationFeed and ActionPort, the same access a real (LLM) agent gets:
     - it learns its home and current state ONLY from its observations;
     - every action goes through its port, tied to the observation it was built from;
+    - each step acts on an observation received AFTER its previous command ended
+      (with a sampler running, the next sample; otherwise one taken now);
+    - it is told only the port's ActionFeedback, never the executor's full result;
     - it never sees the adapter, a drone handle, ground truth or other drones.
 
 A step builds a ProposedAction from (current observation, home observation).
@@ -15,7 +18,7 @@ cannot build a valid action, or finds its barrier broken.
 from dataclasses import dataclass
 from typing import Callable
 
-from models.action import CommandResult, CommandStatus, ProposedAction
+from models.action import ActionFeedback, CommandStatus, ProposedAction
 from models.observation import Observation
 from utils.fleet import PhaseBarrier
 
@@ -38,7 +41,7 @@ class ScriptedMissionAgent:
         self._steps = steps
         self._recorder = recorder
         self._on_step = on_step or (lambda vid, label: None)
-        self.results: list[tuple[str, CommandResult]] = []
+        self.results: list[tuple[str, ActionFeedback]] = []
         self.ended: str = "not started"
         self.home: Observation | None = None
 
@@ -55,7 +58,7 @@ class ScriptedMissionAgent:
                                        "altitude_m": self.home.altitude_m})
         return self.home
 
-    async def run(self) -> list[tuple[str, CommandResult]]:
+    async def run(self) -> list[tuple[str, ActionFeedback]]:
         try:
             home = self.home or self.capture_home()
             if home is None:
@@ -68,7 +71,8 @@ class ScriptedMissionAgent:
                         return self._end(f"aborted before {step.name}: barrier {step.sync.name!r} "
                                          f"broken by {step.sync.broken_by}")
                 self._on_step(self.vehicle_id, step.name)
-                obs = self._feed.observe()
+                obs = await self._feed.current(
+                    newer_than_host_s=getattr(self._port, "last_command_ended_host_s", None))
                 if obs is None:
                     return self._end(f"aborted at {step.name}: no observation")
                 try:
@@ -78,11 +82,11 @@ class ScriptedMissionAgent:
                                      f"({type(err).__name__}: {err})")
                 self._event("agent_step", step=step.name, request_id=action.request_id,
                             observation_id=obs.observation_id)
-                result = await self._port.submit(action, based_on=obs)
+                result = await self._port.submit(action, based_on=obs.observation_id)
                 self.results.append((step.name, result))
                 if result.status != CommandStatus.SUCCEEDED:
                     self._on_step(self.vehicle_id, f"{step.name} FAILED")
-                    return self._end(f"stopped at {step.name}: {result.status.value}")
+                    return self._end(f"stopped at {step.name}: {result.status.value} ({result.code})")
             self._on_step(self.vehicle_id, "done")
             return self._end("completed")
         except BaseException as err:

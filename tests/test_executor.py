@@ -157,6 +157,7 @@ def test_heading_command_succeeds_after_dwell():
     world, drone, ex = setup()
     r = run(ex.execute(rotate(45.0)))
     assert r.status == CommandStatus.SUCCEEDED, r.reason
+    assert r.reason_code == "completed"
     assert r.sent_to_simulator and r.fallback_applied is None
     assert drone.calls == ["rotate_to_yaw"]
     assert r.final_snapshot.heading_deg == pytest.approx(45.0)
@@ -190,6 +191,7 @@ def test_bad_telemetry_preflight_refuses_with_zero_drone_calls(status):
     for action in (rotate(), climb()):
         r = run(ex.execute(action))
         assert r.status == CommandStatus.REFUSED and not r.sent_to_simulator
+        assert r.reason_code == "preflight_not_ready"
         assert status.value in r.reason
     assert drone.calls == []
 
@@ -199,6 +201,7 @@ def test_telemetry_exception_preflight_refuses():
     world.snapshot_raises = True
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.REFUSED and "unavailable" in r.reason
+    assert r.reason_code == "preflight_not_ready"
     assert drone.calls == []
 
 
@@ -210,6 +213,7 @@ def test_not_airborne_preflight_refuses(ground):
     for action in (rotate(), climb(10.0)):
         r = run(ex.execute(action))
         assert r.status == CommandStatus.REFUSED and ground.value in r.reason
+        assert r.reason_code == "preflight_not_ready"
     assert drone.calls == []
 
 
@@ -219,6 +223,7 @@ def test_unsupported_action_refused():
                    ProposedAction(vehicle_id="Drone1", action_type=ActionType.LAND, reason="x")):
         r = run(ex.execute(action))
         assert r.status == CommandStatus.REFUSED and "not supported" in r.reason
+        assert r.reason_code == "unsupported_action"
     assert drone.calls == []
 
 
@@ -227,6 +232,7 @@ def test_unknown_vehicle_refused():
     r = run(ex.execute(ProposedAction(vehicle_id="Drone9", action_type=ActionType.ROTATE_TO_HEADING,
                                       heading_deg=10, reason="x")))
     assert r.status == CommandStatus.REFUSED and drone.calls == []
+    assert r.reason_code == "preflight_not_ready"
 
 
 # ------------------------------------------------------------ failures after dispatch
@@ -235,6 +241,7 @@ def test_command_invocation_exception_fails_sent_and_hovers():
     drone.invoke_raises.add("rotate_to_yaw")
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.FAILED and r.sent_to_simulator
+    assert r.reason_code == "invocation_failed"
     assert "invocation failed" in r.reason and r.fallback_applied == "hover"
     assert drone.calls == ["rotate_to_yaw", "hover"]
 
@@ -244,6 +251,7 @@ def test_simulator_task_exception_fails_and_hovers():
     drone.task_raises.add("move_to_position")
     r = run(ex.execute(climb()))
     assert r.status == CommandStatus.FAILED and r.sent_to_simulator
+    assert r.reason_code == "simulator_error"
     assert "simulator task failed" in r.reason and r.fallback_applied == "hover"
 
 
@@ -252,6 +260,7 @@ def test_simulator_task_timeout_times_out_and_hovers():
     drone.task_hangs.add("rotate_to_yaw")
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.TIMED_OUT and r.sent_to_simulator
+    assert r.reason_code == "task_timeout"
     assert "did not finish" in r.reason and r.fallback_applied == "hover"
     assert drone.calls == ["rotate_to_yaw", "hover"]
 
@@ -261,6 +270,7 @@ def test_settle_timeout_times_out_and_hovers():
     world.stuck = True                     # task "completes" but state never reaches target
     r = run(ex.execute(rotate(45.0)))
     assert r.status == CommandStatus.TIMED_OUT
+    assert r.reason_code == "settle_timeout"
     assert "did not settle" in r.reason and "heading error" in r.reason
     assert r.fallback_applied == "hover"
 
@@ -270,6 +280,7 @@ def test_telemetry_invalid_after_dispatch_fails_and_hovers():
     world.invalid_after_snapshots = 1      # preflight is valid, everything after is stale
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.FAILED and r.sent_to_simulator
+    assert r.reason_code == "telemetry_lost"
     assert "telemetry stale" in r.reason and r.fallback_applied == "hover"
 
 
@@ -279,6 +290,7 @@ def test_telemetry_lost_while_task_running_fails_early():
     world.invalid_after_snapshots = 1
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.FAILED and "while the command was running" in r.reason
+    assert r.reason_code == "telemetry_lost"
     assert r.elapsed_s < 1.0               # didn't wait for the 5 s task deadline
 
 
@@ -294,6 +306,7 @@ def test_grounded_mid_command_fails_without_hovering_on_the_ground():
     world.step = step_then_ground
     r = run(ex.execute(climb(0.5)))
     assert r.status == CommandStatus.FAILED and "grounded" in r.reason
+    assert r.reason_code == "became_grounded"
     assert r.fallback_applied == "none (vehicle grounded)" and "hover" not in drone.calls
 
 
@@ -493,6 +506,7 @@ def test_corrections_are_bounded_then_time_out_and_hover():
     world.misses = [(2.0, 0.0, 0.0)] * 10     # never gets there
     r = run(ex.execute(move()))
     assert r.status == CommandStatus.TIMED_OUT
+    assert r.reason_code == "settle_timeout"
     assert r.corrections == FAST.max_corrections == 2
     assert "after 2 corrections" in r.reason
     assert drone.calls == ["move_to_position"] * 3 + ["hover"]
@@ -529,6 +543,7 @@ def test_correction_command_failure_fails_and_hovers():
     drone._command = second_move_fails
     r = run(ex.execute(move()))
     assert r.status == CommandStatus.FAILED and "correction task failed" in r.reason
+    assert r.reason_code == "simulator_error"
     assert r.corrections == 1 and r.fallback_applied == "hover"
 
 
@@ -542,6 +557,7 @@ def test_unexpected_error_in_settle_check_fails_and_hovers():
     ex._settle_rotate = broken_settle
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.FAILED and r.sent_to_simulator
+    assert r.reason_code == "internal_error"
     assert r.reason == "unexpected executor error: ZeroDivisionError: bug in a completion check"
     assert r.fallback_applied == "hover"
     assert drone.calls == ["rotate_to_yaw", "hover"]
@@ -561,5 +577,16 @@ def test_unexpected_error_while_waiting_for_task_fails_and_hovers():
     ex._check_telemetry = flaky
     r = run(ex.execute(rotate()))
     assert r.status == CommandStatus.FAILED and "KeyError" in r.reason
+    assert r.reason_code == "internal_error"
     assert drone.calls == ["rotate_to_yaw", "hover"]
     assert r.elapsed_s < 1.0
+
+
+def test_every_reason_code_used_in_tests_is_declared():
+    from executor.projectairsim_executor import REASON_CODES
+    import inspect
+    import re
+    import sys
+    src = inspect.getsource(sys.modules[__name__])
+    used = set(re.findall(r'r\.reason_code == "(\w+)"', src))
+    assert used and used <= set(REASON_CODES)

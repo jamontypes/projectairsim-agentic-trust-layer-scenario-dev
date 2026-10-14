@@ -6,7 +6,7 @@ import pytest
 
 from channel.attacks import Drop, PositionOffset, Replay
 from channel.observation_feed import VERDICT_FIELDS, ObservationFeed
-from models.observation import Observation, TrustAssessment, TrustStatus
+from models.observation import TrustAssessment, TrustStatus
 from models.telemetry import ValidationStatus
 from tests.channel_fakes import ListRecorder, SnapAdapter
 
@@ -125,25 +125,136 @@ def test_adapter_error_gives_none_and_is_recorded():
     assert "timed out" in rec.of("observation_error")[0]["error"]
 
 
-def test_issued_accepts_only_the_exact_delivered_object():
+def test_resolve_returns_the_feeds_own_record_for_its_own_ids_only():
     adapter, _, feed = make()
     other = ObservationFeed(adapter, "Drone2")
     obs = feed.observe()
-    assert feed.issued(obs)
-    assert not feed.issued(obs.model_copy())                 # same id, not the delivered object
-    assert not feed.issued(other.observe())                  # another vehicle's observation
-    assert not feed.issued(Observation(observation_id=obs.observation_id, vehicle_id="Drone1",
-                                       sequence=1, channel="x", received_host_s=0.0,
-                                       received_at_utc=obs.received_at_utc, payload={}))
-    assert not feed.issued(None)
+    rec = feed.resolve(obs.observation_id)
+    assert rec is not None and rec is not obs and rec == obs     # same content, separate copy
+    assert feed.resolve(other.observe().observation_id) is None  # another vehicle's id
+    assert feed.resolve("f" * 32) is None
+    assert feed.resolve(None) is None and feed.resolve(obs) is None   # ids only
 
 
-def test_issued_forgets_old_observations_beyond_its_memory():
+def test_editing_the_agents_copy_cannot_change_the_record():
+    _, rec, feed = make()
+    obs = feed.observe()
+    obs.payload["position_ned_m"]["x"] = 999.0
+    obs.payload["altitude_local_m"] = -1.0
+    assert feed.resolve(obs.observation_id).north_m == 1.0
+    assert feed.latest().north_m == 1.0 and feed.history()[-1].altitude_m == 6.0
+    assert rec.of("observation")[0]["observation"]["payload"]["position_ned_m"]["x"] == 1.0
+
+
+def test_observation_fields_cannot_be_reassigned():
+    _, _, feed = make()
+    obs = feed.observe()
+    for field, value in [("vehicle_id", "Drone2"), ("payload", {}), ("assessment", None),
+                         ("received_host_s", 0.0)]:
+        with pytest.raises(Exception):
+            setattr(obs, field, value)
+    with pytest.raises(Exception):
+        obs.assessment.status = TrustStatus.TRUSTED
+
+
+def test_resolve_forgets_old_observations_beyond_its_memory():
     adapter = SnapAdapter()
     feed = ObservationFeed(adapter, "Drone1", remember=2)
     first = feed.observe()
     feed.observe(), feed.observe()
-    assert not feed.issued(first)
+    assert feed.resolve(first.observation_id) is None
+
+
+# ------------------------------------------------------------ cadence and history
+def test_history_and_latest_do_not_sample_and_keep_gaps_from_drops():
+    adapter = SnapAdapter()
+    feed = ObservationFeed(adapter, "Drone1", hooks=[lambda p, c: None if c.sequence == 2 else p],
+                           history_len=3)
+    assert feed.latest() is None and feed.history() == []
+    for _ in range(5):
+        feed.observe()
+    calls = adapter.calls
+    assert [o.sequence for o in feed.history()] == [3, 4, 5]     # bounded, oldest first
+    assert [o.sequence for o in feed.history(2)] == [4, 5] and feed.history(0) == []
+    assert feed.latest().sequence == 5
+    assert adapter.calls == calls                                 # reading never samples
+
+
+def test_sampler_collects_at_its_own_rate_and_assessor_sees_the_stream():
+    import asyncio
+    pairs = []
+
+    class Spy:
+        name = "spy"
+
+        def assess(self, obs, previous):
+            pairs.append((obs.sequence, previous.sequence if previous else None))
+            return TrustAssessment(observation_id=obs.observation_id, assessor="spy",
+                                   assessed=True, status=TrustStatus.TRUSTED)
+
+    async def go():
+        feed = ObservationFeed(SnapAdapter(), "Drone1", assessor=Spy(), recorder=ListRecorder())
+        stop = asyncio.Event()
+        task = asyncio.ensure_future(feed.sample(50.0, stop))
+        await asyncio.sleep(0.25)
+        running = feed.sample_hz
+        stop.set()
+        await task
+        return feed, running
+    feed, running = asyncio.run(go())
+    n = len(pairs)
+    assert running == 50.0 and feed.sample_hz is None
+    assert 6 <= n <= 16                                     # ~12 at 50 Hz over 0.25 s
+    assert pairs == [(i, i - 1 if i > 1 else None) for i in range(1, n + 1)]
+    states = [e["status"] for e in feed._recorder.of("sampling")]
+    assert states == ["started", "stopped"]
+
+
+def test_current_waits_for_a_sample_newer_than_the_given_time():
+    import asyncio
+
+    async def go():
+        feed = ObservationFeed(SnapAdapter(), "Drone1")
+        stop = asyncio.Event()
+        task = asyncio.ensure_future(feed.sample(20.0, stop))
+        await asyncio.sleep(0.12)
+        boundary = feed.clock()
+        newer = await feed.current(newer_than_host_s=boundary, timeout_s=1.0)
+        any_ = await feed.current()
+        stop.set()
+        await task
+        return boundary, newer, any_
+    boundary, newer, any_ = asyncio.run(go())
+    assert newer is not None and newer.received_host_s > boundary
+    assert any_ is not None
+
+
+def test_current_times_out_when_every_message_is_dropped():
+    import asyncio
+
+    async def go():
+        feed = ObservationFeed(SnapAdapter(), "Drone1", hooks=[Drop()])
+        stop = asyncio.Event()
+        task = asyncio.ensure_future(feed.sample(50.0, stop))
+        got = await feed.current(timeout_s=0.2)
+        stop.set()
+        await task
+        return got
+    assert asyncio.run(go()) is None
+
+
+def test_current_without_a_sampler_observes_now():
+    import asyncio
+    adapter = SnapAdapter()
+    feed = ObservationFeed(adapter, "Drone1")
+    obs = asyncio.run(feed.current(newer_than_host_s=1e12))
+    assert obs is not None and adapter.calls == 1
+
+
+def test_sampler_rejects_a_bad_rate():
+    import asyncio
+    with pytest.raises(ValueError):
+        asyncio.run(ObservationFeed(SnapAdapter(), "Drone1").sample(0))
 
 
 def test_unknown_vehicle_rejected():

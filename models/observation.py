@@ -15,6 +15,12 @@ Observation
         payload: the raw message, kept whole for the trust assessor. It includes
         the sender's own claims (claimed vehicle_id, source, sim_time_ns).
 
+    Immutable (frozen): fields cannot be reassigned. The payload dict itself is
+    still a dict, so the feed never hands out its own record: it keeps the
+    authoritative copy and gives the agent a deep copy. A proposal refers to an
+    observation by observation_id; the port resolves that id to the feed's own
+    copy, so whatever the agent did to its copy cannot reach the gate.
+
 TrustAssessment
     The trust/provenance assessor's verdict on one delivered observation.
     NOT_ASSESSED (assessed=False) is what the placeholder assessor returns; it
@@ -31,7 +37,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def new_id() -> str:
@@ -46,6 +52,8 @@ class TrustStatus(str, Enum):
 
 
 class TrustAssessment(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     assessment_id: str = Field(default_factory=new_id)
     observation_id: str
     assessor: str
@@ -56,6 +64,8 @@ class TrustAssessment(BaseModel):
 
 # ------------------------------------------------------------ observation
 class Observation(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     observation_id: str = Field(default_factory=new_id)
     vehicle_id: str
     sequence: int

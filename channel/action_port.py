@@ -1,90 +1,233 @@
 """
 Per-vehicle action port: the ONLY way an agent can act.
 
-    agent -> port.submit(action, based_on=observation)
-          -> ownership + provenance checks  (port_rejected: never reaches gate or executor)
+    agent -> port.submit(action, based_on=observation_id)
+          -> action, ownership, observation and freshness checks
+                                            (port_rejected: never reaches gate or executor)
           -> action-risk gate               (gate_decision; BypassGate for now)
-          -> executor                       (command_result)
+          -> executor                       (command_result: full, evaluation side)
+          -> ActionFeedback to the agent    (feedback: coarse, no ground truth)
 
-Checks, in order (any failure -> CommandResult REFUSED, sent_to_simulator=False):
-    1. the action is for THIS port's vehicle (ownership is bound to the port);
-    2. `based_on` is an Observation this vehicle's feed actually delivered
-       (every proposal is tied to the observation used to make it);
-    3. the request_id has not been submitted before (no replayed proposals).
+`based_on` is the observation_id the agent decided from (an Observation object is
+accepted too; only its id is used, and its content must match the record). The
+port resolves the id through ITS feed, so the gate checks the feed's protected
+record, never the agent's copy, and a serialized agent can refer to observations.
 
-Every step is recorded with the request_id and observation_id, so a command
-result can always be traced back to what the agent saw when it proposed it.
-If the caller is cancelled during execution, a command_cancelled event is
-recorded (the executor hovers the drone) and the cancellation propagates.
+Checks, in order (any failure -> REFUSED at stage "port", nothing sent):
+    invalid_action          the action does not re-validate (e.g. edited after creation)
+    wrong_vehicle           the action is not for THIS port's vehicle
+    unknown_observation     the id was not delivered by this vehicle's feed (or is
+                            forgotten); another vehicle's ids are unknown here
+    altered_observation     an Observation object was passed whose content differs
+                            from what the feed delivered
+    busy                    another command from this port is still being handled
+    duplicate_request       the request_id was submitted before (no replays)
+    observation_expired     the observation is older than max_observation_age_s
+    observation_superseded  the observation predates the end of this vehicle's
+                            previous command (it can't reflect that command's outcome)
+After the gate, the age is checked again (a slow review can expire it).
+
+What the agent is told (ActionFeedback): its own request's ids, the stage, a status,
+a small fixed vocabulary of codes with fixed messages for executor outcomes, whether
+anything was sent and the fallback category. The executor's full CommandResult
+(measured errors, ground-truth snapshots, exception text) goes only to the recorder.
+Port and gate messages are passed through: they are computed from what the agent
+sent and saw, not from ground truth.
+
+If the caller is cancelled during execution, a command_cancelled event is recorded
+(the executor hovers the drone) and the cancellation propagates.
 """
 import asyncio
-import time
+
+from pydantic import ValidationError
 
 from gate.action_gate import BypassGate
-from models.action import CommandResult, CommandStatus, ProposedAction
+from models.action import (ActionFeedback, CommandResult, CommandStatus, FeedbackStage,
+                           ProposedAction)
+from models.observation import Observation
+
+DEFAULT_MAX_OBSERVATION_AGE_S = 10.0
+
+# executor reason_code -> (agent code, agent message). Anything unlisted -> "failed".
+_EXECUTOR_FEEDBACK = {
+    "completed": ("completed", "Command completed: the flight controller reports the target "
+                               "reached and is holding there."),
+    "unsupported_action": ("unsupported_action", "This action type is not supported yet; "
+                                                 "nothing was sent."),
+    "preflight_not_ready": ("not_ready", "The flight controller refused the command because the "
+                                         "vehicle is not ready; nothing was sent."),
+    "task_timeout": ("timed_out", "The command did not complete in time."),
+    "settle_timeout": ("timed_out", "The command did not complete in time."),
+}
+_FAILED = ("failed", "The command failed in the flight controller.")
+
+
+def agent_fallback(fallback: str | None) -> str | None:
+    if fallback is None:
+        return None
+    if fallback == "hover":
+        return "hover"
+    if fallback.startswith("hover failed"):
+        return "hover_failed"
+    return "none"
+
+
+_FALLBACK_TEXT = {"hover": " The vehicle was told to hover.",
+                  "hover_failed": " A hover was commanded but could not be confirmed.",
+                  "none": " No further command was sent to the vehicle."}
 
 
 class ActionPort:
     def __init__(self, vehicle_id: str, executor, feed, gate=None, recorder=None,
-                 clock=time.monotonic):
+                 clock=None, max_observation_age_s: float = DEFAULT_MAX_OBSERVATION_AGE_S):
         if feed.vehicle_id != vehicle_id:
             raise ValueError(f"feed for {feed.vehicle_id!r} cannot back the port for {vehicle_id!r}")
         self.vehicle_id = vehicle_id
+        self.max_observation_age_s = max_observation_age_s
         self._executor = executor
         self._feed = feed
         self._gate = gate or BypassGate()
         self._recorder = recorder
-        self._clock = clock
+        self._clock = clock or feed.clock      # same clock as the feed's receipt stamps
         self._seen_requests: set[str] = set()
+        self._busy: str | None = None
+        self._last_end: float | None = None
 
-    async def submit(self, action: ProposedAction, based_on) -> CommandResult:
-        obs_id = getattr(based_on, "observation_id", None)
-        self._record("proposal", request_id=action.request_id, observation_id=obs_id,
-                     action=action.model_dump(mode="json"))
+    @property
+    def last_command_ended_host_s(self) -> float | None:
+        """When this port's previous command left the executor (host clock), or None.
+        Decide from an observation received after this (feed.current(newer_than_host_s=...))."""
+        return self._last_end
 
-        problem = None
-        if action.vehicle_id != self.vehicle_id:
-            problem = (f"port for {self.vehicle_id} cannot submit an action for "
-                       f"{action.vehicle_id}")
-        elif not self._feed.issued(based_on):
-            problem = ("proposal is not based on an observation delivered by "
-                       f"{self.vehicle_id}'s feed")
-        elif action.request_id in self._seen_requests:
-            problem = f"request_id {action.request_id} was already submitted"
-        if problem:
-            self._record("port_rejected", request_id=action.request_id,
-                         observation_id=obs_id, reason=problem)
-            return self._refused(action, f"action port: {problem}")
-        self._seen_requests.add(action.request_id)
+    @property
+    def supported_actions(self) -> list[str]:
+        return [a.value for a in getattr(self._executor, "SUPPORTED", ())]
 
+    async def submit(self, action, based_on) -> ActionFeedback:
+        raw_request_id = getattr(action, "request_id", None)
+        obs_id = based_on.observation_id if isinstance(based_on, Observation) else based_on
+        obs_id = obs_id if isinstance(obs_id, str) else None
+        record = self._feed.resolve(obs_id)
+        age = None if record is None else round(self._clock() - record.received_host_s, 3)
+        self._record("proposal", request_id=raw_request_id, observation_id=obs_id,
+                     observation_age_s=age,
+                     action=action.model_dump(mode="json") if hasattr(action, "model_dump")
+                     else repr(action))
+
+        # Re-validate: a ProposedAction can be edited after construction (pydantic does not
+        # validate on assignment), and the executor must get a copy the agent can't touch.
         try:
-            decision = self._gate.decide(action, based_on)
+            if isinstance(action, ProposedAction):
+                action = ProposedAction.model_validate(action.model_dump())
+            else:
+                action = ProposedAction.model_validate(action)
+        except ValidationError as err:
+            msg = "; ".join(e["msg"] for e in err.errors())
+            return self._reject(None, obs_id, "invalid_action", f"action is not valid: {msg}",
+                                request_id=raw_request_id)
+
+        rid = action.request_id
+        if action.vehicle_id != self.vehicle_id:
+            return self._reject(action, obs_id, "wrong_vehicle",
+                                f"port for {self.vehicle_id} cannot submit an action for "
+                                f"{action.vehicle_id}")
+        if record is None:
+            return self._reject(action, obs_id, "unknown_observation",
+                                f"observation {obs_id!r} was not delivered by {self.vehicle_id}'s "
+                                f"feed (or is too old to be remembered)")
+        if (isinstance(based_on, Observation)
+                and based_on.model_dump_json() != record.model_dump_json()):
+            return self._reject(action, obs_id, "altered_observation",
+                                "the observation passed in differs from the one the feed "
+                                "delivered under that id")
+        if self._busy is not None:
+            return self._reject(action, obs_id, "busy",
+                                f"another command ({self._busy}) is still being handled for "
+                                f"{self.vehicle_id}; wait for its result")
+        if rid in self._seen_requests:
+            return self._reject(action, obs_id, "duplicate_request",
+                                f"request_id {rid} was already submitted")
+        if age > self.max_observation_age_s:
+            return self._reject(action, obs_id, "observation_expired",
+                                f"observation is {age:.1f} s old (limit "
+                                f"{self.max_observation_age_s:.1f} s); observe again")
+        if self._last_end is not None and record.received_host_s <= self._last_end:
+            return self._reject(action, obs_id, "observation_superseded",
+                                "observation was received before your previous command ended; "
+                                "observe again")
+
+        self._seen_requests.add(rid)
+        self._busy = rid
+        try:
+            return await self._gate_and_execute(action, record)
+        finally:
+            self._busy = None
+
+    # ------------------------------------------------------------ internal
+    async def _gate_and_execute(self, action: ProposedAction, record: Observation) -> ActionFeedback:
+        rid, obs_id = action.request_id, record.observation_id
+        try:
+            decision = self._gate.decide(action, record)
         except Exception as err:   # a broken gate blocks; it never waves actions through
-            self._record("gate_error", request_id=action.request_id, observation_id=obs_id,
+            self._record("gate_error", request_id=rid, observation_id=obs_id,
                          error=f"{type(err).__name__}: {err}")
-            return self._refused(action, f"gate error: {type(err).__name__}: {err}")
+            return self._feedback(action, obs_id, FeedbackStage.GATE, CommandStatus.REFUSED,
+                                  "gate_error", "The action-risk gate failed; the action was "
+                                  "blocked and nothing was sent.")
         self._record("gate_decision", decision=decision.model_dump(mode="json"))
+        gate_info = {"gate_outcome": decision.outcome.value, "gate_assessed": decision.assessed}
         if not decision.allows_execution:
-            return self._refused(action, f"gate {decision.gate}: {decision.reason}")
+            return self._feedback(action, obs_id, FeedbackStage.GATE, CommandStatus.REFUSED,
+                                  f"gate_{decision.outcome.value}",
+                                  f"Blocked by the action-risk gate: {decision.reason}", **gate_info)
+
+        age = self._clock() - record.received_host_s
+        if age > self.max_observation_age_s:
+            return self._reject(action, obs_id, "observation_expired",
+                                f"observation expired while the action was being reviewed "
+                                f"({age:.1f} s old, limit {self.max_observation_age_s:.1f} s); "
+                                f"observe again", **gate_info)
 
         started = self._clock()
         try:
             result = await self._executor.execute(action)
         except BaseException as err:
             kind = "command_cancelled" if isinstance(err, asyncio.CancelledError) else "command_error"
-            self._record(kind, request_id=action.request_id, observation_id=obs_id,
+            self._record(kind, request_id=rid, observation_id=obs_id,
                          elapsed_s=round(self._clock() - started, 3),
                          error=f"{type(err).__name__}: {err}")
             raise
+        finally:
+            self._last_end = self._clock()
         self._record("command_result", observation_id=obs_id, decision_id=decision.decision_id,
+                     observation_age_at_dispatch_s=round(started - record.received_host_s, 3),
                      result=summarize_result(result))
-        return result
+        code, message = _EXECUTOR_FEEDBACK.get(result.reason_code, _FAILED)
+        if code == "unsupported_action" and self.supported_actions:
+            message += f" Supported: {', '.join(self.supported_actions)}."
+        fallback = agent_fallback(result.fallback_applied)
+        if fallback is not None:
+            message += _FALLBACK_TEXT[fallback]
+        return self._feedback(action, obs_id, FeedbackStage.EXECUTOR, result.status, code, message,
+                              sent_to_simulator=result.sent_to_simulator, fallback=fallback,
+                              elapsed_s=result.elapsed_s, **gate_info)
 
-    # ------------------------------------------------------------ internal
-    def _refused(self, action, reason) -> CommandResult:
-        return CommandResult(request_id=action.request_id, vehicle_id=action.vehicle_id,
-                             action_type=action.action_type, status=CommandStatus.REFUSED,
-                             reason=reason, sent_to_simulator=False)
+    def _reject(self, action, obs_id, code, reason, request_id=None, **kw) -> ActionFeedback:
+        rid = action.request_id if action is not None else request_id
+        self._record("port_rejected", request_id=rid, observation_id=obs_id, code=code,
+                     reason=reason)
+        return self._feedback(action, obs_id, FeedbackStage.PORT, CommandStatus.REFUSED, code,
+                              f"Rejected by the action port: {reason}", request_id=rid, **kw)
+
+    def _feedback(self, action, obs_id, stage, status, code, message, request_id=None,
+                  **kw) -> ActionFeedback:
+        fb = ActionFeedback(
+            request_id=action.request_id if action is not None else request_id,
+            vehicle_id=self.vehicle_id,
+            action_type=action.action_type if action is not None else None,
+            observation_id=obs_id, stage=stage, status=status, code=code, message=message, **kw)
+        self._record("feedback", feedback=fb.model_dump(mode="json"))
+        return fb
 
     def _record(self, kind, **fields):
         if self._recorder is not None:

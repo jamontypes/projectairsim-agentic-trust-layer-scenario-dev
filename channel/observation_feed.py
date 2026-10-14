@@ -6,26 +6,44 @@ Per-vehicle observation channel: the ONLY way an agent learns about its drone.
         -> attack hooks, in order (may modify or drop)      (channel/attacks.py)
         -> receiver stamps id / channel / sequence / receipt time
         -> trust assessor (sees only what was delivered)    (trust/assessor.py)
-        -> Observation handed to the agent
+        -> authoritative record kept by the feed; the agent gets a deep COPY
         -> recorder (evaluation side): delivered payload + assessment, and, only
            there, which hooks changed it and the clean payload
 
 One feed per vehicle. A feed never serves another vehicle, and an agent holds
 only its feed and its action port, never the adapter or a drone handle.
 
-observe() returns None when there is nothing to deliver (adapter error or a
-dropped message). Agents must treat None as "no information", not as "no change".
+Protected copies and references
+    The feed keeps its own copy of every observation it delivered (bounded memory)
+    and never hands that copy out. resolve(observation_id) returns it to the
+    action port and gate. A proposal therefore only needs the observation_id, which
+    is what an external (LLM / tool-call) agent can send; editing the agent's copy
+    cannot change what the gate checks.
+
+Cadence (two different rates, on purpose)
+    sample(rate_hz) collects observations at a fixed rate in the background, so
+    the assessor sees a regular stream (it gets each observation with the previous
+    one) and a short history exists, whatever the agent does. The agent decides at
+    its own, slower pace and reads latest() / history() / current() without
+    causing new samples. Without a sampler, current() and observe() take one now.
+    The evaluator's 20 Hz separation samples are ground truth and are NOT
+    observations: no agent or assessor ever sees them.
+
+observe() and current() return None when there is nothing to deliver (adapter
+error or a dropped message). Agents must treat None as "no information", not as
+"no change".
 
 The source is simulator ground truth (Project AirSim kinematics), named in
 `channel`. A sensor-based source (GPS/IMU topics) would be a different channel.
 """
+import asyncio
 import copy
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 
 from channel.attacks import HookContext
-from models.observation import Observation
+from models.observation import Observation, TrustAssessment, TrustStatus
 from trust.assessor import NoTrustAssessor
 
 # Adapter-computed verdict fields: computed on CLEAN data, so never delivered.
@@ -36,25 +54,111 @@ def _hook_name(hook) -> str:
     return getattr(hook, "name", None) or getattr(hook, "__name__", None) or type(hook).__name__
 
 
+def _agent_copy(obs: Observation | None) -> Observation | None:
+    return None if obs is None else obs.model_copy(deep=True)
+
+
 class ObservationFeed:
     def __init__(self, adapter, vehicle_id: str, hooks=(), assessor=None, recorder=None,
-                 clock=time.monotonic, remember: int = 1000):
+                 clock=time.monotonic, remember: int = 1000, history_len: int = 50):
         if vehicle_id not in getattr(adapter, "vehicle_ids", [vehicle_id]):
             raise ValueError(f"unknown vehicle {vehicle_id!r}")
         self.vehicle_id = vehicle_id
         self.channel = f"projectairsim_ground_truth:{vehicle_id}"
+        self.clock = clock
+        self.sample_hz: float | None = None      # set while sample() runs
         self._adapter = adapter
         self._hooks = list(hooks)
         self._assessor = assessor or NoTrustAssessor()
         self._recorder = recorder
-        self._clock = clock
         self._seq = 0
         self._previous: Observation | None = None
         self._issued: OrderedDict[str, Observation] = OrderedDict()
         self._remember = remember
+        self._history: deque[Observation] = deque(maxlen=history_len)
+        self._new_event: asyncio.Event | None = None
+        self._new_loop = None
 
-    # ------------------------------------------------------------ public
+    # ------------------------------------------------------------ agent side
     def observe(self) -> Observation | None:
+        """Take one observation now. Returns the agent's copy."""
+        return _agent_copy(self._take())
+
+    def latest(self) -> Observation | None:
+        """Most recent delivered observation (agent copy), without sampling."""
+        return _agent_copy(self._history[-1]) if self._history else None
+
+    def history(self, n: int | None = None) -> list[Observation]:
+        """Up to the last n delivered observations, oldest first (agent copies).
+        Dropped messages leave gaps in `sequence`; that is information too."""
+        items = list(self._history)
+        if n is not None:
+            items = items[-n:] if n > 0 else []
+        return [_agent_copy(o) for o in items]
+
+    async def current(self, newer_than_host_s: float | None = None,
+                      timeout_s: float = 2.0) -> Observation | None:
+        """An observation received after `newer_than_host_s` (e.g. after the end of
+        the agent's last command, so it reflects the command's outcome).
+
+        With a sampler running, waits for the next sample (up to timeout_s; None if
+        none arrives, e.g. every message is being dropped). Without one, observes now.
+        """
+        if self.sample_hz is None:
+            return self.observe()
+        deadline = self.clock() + timeout_s
+        while True:
+            last = self._history[-1] if self._history else None
+            if last is not None and (newer_than_host_s is None
+                                     or last.received_host_s > newer_than_host_s):
+                return _agent_copy(last)
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return None
+            new = self._new()
+            new.clear()
+            try:
+                await asyncio.wait_for(new.wait(), remaining)
+            except asyncio.TimeoutError:
+                return None
+
+    async def sample(self, rate_hz: float, stop: asyncio.Event | None = None) -> None:
+        """Observe at a fixed rate until `stop` is set or the task is cancelled."""
+        if not rate_hz > 0:
+            raise ValueError("rate_hz must be > 0")
+        period = 1.0 / rate_hz
+        self.sample_hz = rate_hz
+        self._record("sampling", status="started", rate_hz=rate_hz)
+        try:
+            next_t = self.clock()
+            while stop is None or not stop.is_set():
+                self._take()
+                next_t += period
+                delay = next_t - self.clock()
+                if delay < 0:          # fell behind (slow adapter): don't burst to catch up
+                    next_t, delay = self.clock(), 0.0
+                if stop is None:
+                    await asyncio.sleep(delay)
+                else:
+                    try:
+                        await asyncio.wait_for(stop.wait(), delay)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            self.sample_hz = None
+            self._notify()             # wake current() waiters so they fall back / time out
+            self._record("sampling", status="stopped", rate_hz=rate_hz, last_sequence=self._seq)
+
+    # ------------------------------------------------------------ port / gate side
+    def resolve(self, observation_id) -> Observation | None:
+        """The feed's own record of an observation it delivered and still remembers,
+        or None (unknown id, another vehicle's id, forgotten, not a string)."""
+        if not isinstance(observation_id, str):
+            return None
+        return self._issued.get(observation_id)
+
+    # ------------------------------------------------------------ internal
+    def _take(self) -> Observation | None:
         self._seq += 1
         seq = self._seq
         try:
@@ -62,7 +166,7 @@ class ObservationFeed:
         except Exception as err:
             self._record("observation_error", sequence=seq, error=f"{type(err).__name__}: {err}")
             return None
-        received = self._clock()
+        received = self.clock()
         source_validation = {
             "status": snap.validation_status.value,
             "errors": list(snap.validation_errors),
@@ -94,19 +198,21 @@ class ObservationFeed:
 
         obs = Observation(vehicle_id=self.vehicle_id, sequence=seq, channel=self.channel,
                           received_host_s=received, received_at_utc=datetime.now(timezone.utc),
-                          payload=payload)
+                          payload=copy.deepcopy(payload))
         try:
-            obs.assessment = self._assessor.assess(obs, self._previous)
+            assessment = self._assessor.assess(obs, self._previous)
         except Exception as err:
-            from models.observation import TrustAssessment, TrustStatus
-            obs.assessment = TrustAssessment(
+            assessment = TrustAssessment(
                 observation_id=obs.observation_id, assessor=getattr(self._assessor, "name", "?"),
                 assessed=False, status=TrustStatus.NOT_ASSESSED,
                 reasons=[f"assessor raised {type(err).__name__}: {err}"])
+        obs = obs.model_copy(update={"assessment": assessment})
         self._previous = obs
+        self._history.append(obs)
         self._issued[obs.observation_id] = obs
         while len(self._issued) > self._remember:
             self._issued.popitem(last=False)
+        self._notify()
 
         rec = {"observation": obs.model_dump(mode="json"),
                "source_validation": source_validation}   # evaluation side only
@@ -116,14 +222,17 @@ class ObservationFeed:
         self._record("observation", **rec)
         return obs
 
-    def issued(self, observation) -> bool:
-        """True only for the exact Observation object this feed delivered (and still
-        remembers). A copy with the same id, or one built by hand, does not count."""
-        return (isinstance(observation, Observation)
-                and observation.vehicle_id == self.vehicle_id
-                and self._issued.get(observation.observation_id) is observation)
+    def _new(self) -> asyncio.Event:
+        # created lazily inside the running loop (a feed may outlive one asyncio.run)
+        loop = asyncio.get_running_loop()
+        if self._new_event is None or self._new_loop is not loop:
+            self._new_event, self._new_loop = asyncio.Event(), loop
+        return self._new_event
 
-    # ------------------------------------------------------------ internal
+    def _notify(self) -> None:
+        if self._new_event is not None:
+            self._new_event.set()
+
     def _record(self, kind, **fields):
         if self._recorder is not None:
             self._recorder.record(kind, vehicle_id=self.vehicle_id, **fields)

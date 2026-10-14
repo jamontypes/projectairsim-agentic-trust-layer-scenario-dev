@@ -12,7 +12,8 @@ gate actions before anything reaches the simulator.
                      |                                              (BypassGate now)
       ObservationFeed per drone                                           |
   strip verdict -> attack hooks -> trust assessor --> Agent --> ActionPort per drone
-                                  (none yet)
+  (sampled at a fixed rate,       (none yet)    (by observation_id)   |
+   history kept per drone)                 <-- ActionFeedback (no ground truth)
 
   EvaluationRecorder (runs/*.jsonl): every observation, proposal, decision,
   result, correction, cancellation, shutdown, ground-truth pose and collision
@@ -22,11 +23,11 @@ gate actions before anything reaches the simulator.
 
 | Component | Ground truth | Its own drone's delivered observations | Raw payload | Clean (pre-attack) payload / attack details | Other drones' observations |
 |---|---|---|---|---|---|
-| Agent | No | Yes | Yes | No | No (explicit peer reports later) |
+| Agent | No (feedback is ActionFeedback: status + fixed codes, no positions or measured errors) | Yes (its own deep copies) | Yes | No | No (explicit peer reports later) |
 | Trust / provenance assessor | No | Yes (+ previous one) | Yes | No | No (peer reports later) |
-| Action-risk gate | No | Yes, with its trust assessment | Yes | No | No (peer reports later) |
+| Action-risk gate | No | Yes, the feed's protected record (not the agent's copy), with its trust assessment | Yes | No | No (peer reports later) |
 | Executor | **Yes** (preflight, settle, corrections) | No | No | No | No |
-| Recorder / separation | Yes | Yes | Yes | Yes | Yes |
+| Recorder / separation | Yes (full CommandResult, snapshots, reasons) | Yes | Yes | Yes | Yes |
 
 The executor deliberately uses simulator ground truth: it plays the role of a
 reliable flight controller. Consequence for experiments: when an agent's
@@ -35,6 +36,15 @@ attack shows up as the agent commanding the WRONG target, executed precisely
 (see `test_attack_misleads_the_agent_and_executor_flies_the_wrong_target_accurately`).
 Experiments that attack the flight controller's own sensing would need a
 different executor.
+
+How an agent refers to what it saw: proposals carry an `observation_id`. The
+port resolves it through the agent's own feed to the feed's protected record and
+rejects unknown ids (including other drones'), altered observation objects,
+expired observations (`max_observation_age_s`, checked again after the gate),
+observations received before the previous command ended, concurrent submissions
+and replayed request ids. Observations are sampled at a fixed rate
+(`ObservationFeed.sample`), independent of how often the agent decides; the
+evaluator's 20 Hz ground-truth samples are not observations.
 
 Placeholders are explicit, never silent: with no assessor every observation is
 `not_assessed`, and with no gate every action is `bypassed` (`assessed=false`).
@@ -57,7 +67,9 @@ don't.
 | 5.3 | Pairwise separation + collision assessment; executor catch-all after dispatch; missions cancelled and awaited before shutdown | done |
 | 5.4 | Cancellation survives repeated Ctrl+C and cancels each drone's task once (takeoff included); separation counts only fresh, in-sync samples and reports INCONCLUSIVE on poor coverage | done |
 | 5.5 | Observation feed (verdict stripped, attack hooks before assessment, receiver-stamped ids), vehicle-bound action port (ownership, observation linkage, no replays, explicit gate bypass), JSONL evaluation recorder written during the run; three-drone demo runs through agents, with a sync point before descending; agents capture home on the ground before takeoff; altitude tolerance 0.5 m (Simple Flight accuracy) | done |
-| 5.6+ | Trust assessor, action-risk gate, attack scenarios; `move_along_track`, `takeoff`, `land` | next |
+| 5.6a | Interface hardening for external (LLM) agents: agent-facing `ActionFeedback` (no ground truth, fixed codes; full `CommandResult` evaluation side only, executor `reason_code`), proposals by `observation_id` resolved to frozen, feed-protected records, freshness and supersession checks, one command in flight per drone, fixed-rate observation sampling with history | done (offline) |
+| 5.6b | Gemini pilot for one drone through the same feed/port (provider-replaceable) | next |
+| later | Trust assessor (scores + per-check results), action-risk gate with escalation, peer broadcasts, attack scenarios; `move_along_track`, `takeoff`, `land` | planned |
 
 ## Setup (Windows)
 
@@ -89,7 +101,7 @@ All commands from the repo root.
 | `python test_adapter_live.py [--fly]` | yes | Snapshots at 2 Hz, optionally during a flight |
 | `python test_executor_live.py` | yes | Executor: takeoff (setup), rotate +90 deg, climb 2 m, safe shutdown |
 | `python test_multi_drone_live.py` | yes | Three drones (scene_three_drones.jsonc), each flown by a scripted agent through its own feed and port: climb to separate layers, fan out, turn, return, (wait for all) descend, land. Writes `runs/run_<id>.jsonl`. PASS also requires >= 2 m separation between every pair, no drone-to-drone collisions or impacts, and adequate telemetry coverage (otherwise the separation verdict is INCONCLUSIVE, which fails the run) |
-| `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone chain observation -> proposal -> gate decision -> result, shutdowns, separation; works on incomplete runs |
+| `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone observation stream counts and chain observation (age) -> proposal -> gate decision -> result -> feedback code, shutdowns, separation; works on incomplete runs |
 | `python telemetry_explorer.py` | yes | Dumps every non-camera topic to `telemetry_dump.json` |
 
 Every script that arms the drone calls `utils.flight_safety.safe_shutdown()`

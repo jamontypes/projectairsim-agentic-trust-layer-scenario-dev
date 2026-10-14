@@ -81,12 +81,30 @@ class ExecutorConfig:
     position: PositionTolerance = field(default_factory=PositionTolerance)
 
 
+# CommandResult.reason_code values. `reason` is free text for people (it quotes
+# measured errors, i.e. ground truth); the code is what other components may
+# branch on. The action port maps these to the agent's coarse feedback.
+REASON_CODES = (
+    "completed",            # settled within tolerance
+    "unsupported_action",   # action type not implemented (nothing sent)
+    "preflight_not_ready",  # telemetry unavailable / not VALID / not airborne (nothing sent)
+    "not_accepted",         # simulator did not accept the request in time
+    "invocation_failed",    # sending the request raised
+    "simulator_error",      # the simulator task raised
+    "task_timeout",         # the simulator task did not finish in time
+    "settle_timeout",       # did not settle within tolerance in time
+    "telemetry_lost",       # telemetry unavailable or not VALID mid-command
+    "became_grounded",      # vehicle grounded mid-command
+    "internal_error",       # unexpected executor error after dispatch
+)
+
+
 class _Abort(Exception):
     """Internal: stop the command with this status/reason and apply the fallback."""
 
-    def __init__(self, status: CommandStatus, reason: str):
+    def __init__(self, status: CommandStatus, reason: str, code: str):
         super().__init__(reason)
-        self.status, self.reason = status, reason
+        self.status, self.reason, self.code = status, reason, code
 
 
 class ProjectAirSimExecutor:
@@ -116,7 +134,7 @@ class ProjectAirSimExecutor:
                                    self._move_task_timeout, self._correct_move)
         return self._result(action, CommandStatus.REFUSED,
                             f"{action.action_type.value} is not supported by the executor yet",
-                            started=self._clock())
+                            started=self._clock(), reason_code="unsupported_action")
 
     async def rotate_to_heading(self, vehicle_id: str, heading_deg: float,
                                 reason: str = "direct rotate_to_heading call") -> CommandResult:
@@ -242,17 +260,19 @@ class ProjectAirSimExecutor:
             except Exception as err:
                 return self._result(action, CommandStatus.REFUSED,
                                     f"preflight: telemetry unavailable ({type(err).__name__}: {err})",
-                                    started)
+                                    started, reason_code="preflight_not_ready")
             if start.validation_status != ValidationStatus.VALID:
                 return self._result(action, CommandStatus.REFUSED,
                                     f"preflight: telemetry {start.validation_status.value}: "
                                     f"{'; '.join(start.validation_errors)}",
-                                    started, start_snapshot=start, final_snapshot=start)
+                                    started, reason_code="preflight_not_ready",
+                                    start_snapshot=start, final_snapshot=start)
             if start.ground_state != GroundState.AIRBORNE:
                 return self._result(action, CommandStatus.REFUSED,
                                     f"preflight: vehicle is {start.ground_state.value} "
                                     f"({start.ground_state_basis}); command requires airborne",
-                                    started, start_snapshot=start, final_snapshot=start)
+                                    started, reason_code="preflight_not_ready",
+                                    start_snapshot=start, final_snapshot=start)
 
             timeout_s = task_timeout(action, start) if callable(task_timeout) else task_timeout
             state = {"sent": False, "task": None, "last": start, "corrections": 0}
@@ -264,7 +284,8 @@ class ProjectAirSimExecutor:
                     reason = "settled within tolerance" + (
                         f" after {n} correction{'s' if n > 1 else ''}" if n else "")
                     return self._result(action, CommandStatus.SUCCEEDED, reason,
-                                        started, sent_to_simulator=True, corrections=n,
+                                        started, reason_code="completed",
+                                        sent_to_simulator=True, corrections=n,
                                         start_snapshot=start, final_snapshot=state["last"])
                 except _Abort as abort:
                     self._cancel_task(state)
@@ -272,6 +293,7 @@ class ProjectAirSimExecutor:
                     self._emit("fallback", action, status=abort.status.value, reason=abort.reason,
                                fallback=fallback, sent=state["sent"])
                     return self._result(action, abort.status, abort.reason, started,
+                                        reason_code=abort.code,
                                         sent_to_simulator=state["sent"], fallback_applied=fallback,
                                         corrections=state["corrections"],
                                         start_snapshot=start, final_snapshot=state["last"])
@@ -288,7 +310,8 @@ class ProjectAirSimExecutor:
                                fallback=fallback, sent=state["sent"])
                     return self._result(action, CommandStatus.FAILED,
                                         f"unexpected executor error: {type(err).__name__}: {err}",
-                                        started, sent_to_simulator=state["sent"],
+                                        started, reason_code="internal_error",
+                                        sent_to_simulator=state["sent"],
                                         fallback_applied=fallback, corrections=state["corrections"],
                                         start_snapshot=start, final_snapshot=state["last"])
             except asyncio.CancelledError:
@@ -313,9 +336,11 @@ class ProjectAirSimExecutor:
             return await asyncio.wait_for(cmd(drone, action, *args), cfg.invoke_timeout_s)
         except asyncio.TimeoutError:
             raise _Abort(CommandStatus.TIMED_OUT,
-                         f"simulator did not accept the command within {cfg.invoke_timeout_s:.1f} s")
+                         f"simulator did not accept the command within {cfg.invoke_timeout_s:.1f} s",
+                         "not_accepted")
         except Exception as err:
-            raise _Abort(CommandStatus.FAILED, f"command invocation failed: {type(err).__name__}: {err}")
+            raise _Abort(CommandStatus.FAILED, f"command invocation failed: {type(err).__name__}: {err}",
+                         "invocation_failed")
 
     async def _await_task(self, task, timeout_s, action, state, what="simulator task"):
         """Wait for a simulator task (host-time deadline), watching telemetry throughout."""
@@ -327,10 +352,12 @@ class ProjectAirSimExecutor:
                 try:
                     task.result()
                 except Exception as err:
-                    raise _Abort(CommandStatus.FAILED, f"{what} failed: {type(err).__name__}: {err}")
+                    raise _Abort(CommandStatus.FAILED, f"{what} failed: {type(err).__name__}: {err}",
+                                 "simulator_error")
                 return
             if deadline.expired:
-                raise _Abort(CommandStatus.TIMED_OUT, f"{what} did not finish within {timeout_s:.1f} s")
+                raise _Abort(CommandStatus.TIMED_OUT, f"{what} did not finish within {timeout_s:.1f} s",
+                             "task_timeout")
             self._check_telemetry(action, state, "while the command was running")
 
     async def _dispatch_and_wait(self, drone, action, start, start_cmd, settle, timeout_s, state,
@@ -374,7 +401,7 @@ class ProjectAirSimExecutor:
                 raise _Abort(CommandStatus.TIMED_OUT,
                              f"did not settle within {cfg.settle_timeout_s:.1f} s"
                              + (f" after {n} correction{'s' if n > 1 else ''}" if n else "")
-                             + f" (held {dwell.held_s:.2f} s; last: {detail})")
+                             + f" (held {dwell.held_s:.2f} s; last: {detail})", "settle_timeout")
             await self._sleep(cfg.poll_interval_s)
 
     def _check_telemetry(self, action, state, when: str) -> TelemetrySnapshot:
@@ -382,14 +409,15 @@ class ProjectAirSimExecutor:
             snap = self._snapshot(action.vehicle_id)
         except Exception as err:
             raise _Abort(CommandStatus.FAILED,
-                         f"telemetry unavailable {when} ({type(err).__name__}: {err})")
+                         f"telemetry unavailable {when} ({type(err).__name__}: {err})",
+                         "telemetry_lost")
         state["last"] = snap
         if snap.validation_status != ValidationStatus.VALID:
             raise _Abort(CommandStatus.FAILED,
                          f"telemetry {snap.validation_status.value} {when}: "
-                         f"{'; '.join(snap.validation_errors)}")
+                         f"{'; '.join(snap.validation_errors)}", "telemetry_lost")
         if snap.ground_state == GroundState.GROUNDED:
-            raise _Abort(CommandStatus.FAILED, f"vehicle became grounded {when}")
+            raise _Abort(CommandStatus.FAILED, f"vehicle became grounded {when}", "became_grounded")
         return snap
 
     # ------------------------------------------------------------ fallback

@@ -8,7 +8,8 @@ from channel.action_port import ActionPort
 from channel.attacks import PositionOffset
 from channel.observation_feed import ObservationFeed
 from executor.projectairsim_executor import ProjectAirSimExecutor
-from models.action import ActionType, CommandResult, CommandStatus, ProposedAction
+from models.action import (ActionFeedback, ActionType, CommandStatus, FeedbackStage,
+                           ProposedAction)
 from tests.channel_fakes import ListRecorder, SnapAdapter
 from tests.test_executor import FAST, MultiAdapter
 from utils.fleet import PhaseBarrier, run_all_or_cancel
@@ -69,8 +70,11 @@ class FakePort:
         if self.block_on and action.reason == self.block_on:
             await asyncio.sleep(3600)
         status = self.statuses.pop(0) if self.statuses else CommandStatus.SUCCEEDED
-        return CommandResult(request_id=action.request_id, vehicle_id=action.vehicle_id,
-                             action_type=action.action_type, status=status)
+        return ActionFeedback(request_id=action.request_id, vehicle_id=action.vehicle_id,
+                              action_type=action.action_type, observation_id=based_on,
+                              stage=FeedbackStage.EXECUTOR, status=status,
+                              code="completed" if status == CommandStatus.SUCCEEDED else "failed",
+                              message="fake")
 
 
 def alt_step(vid, name, alt, sync=None):
@@ -90,7 +94,8 @@ def test_agent_runs_steps_in_order_each_on_a_fresh_observation():
     a, port, _ = agent()
     results = asyncio.run(a.run())
     assert [n for n, _ in results] == ["a", "b"] and a.ended == "completed"
-    obs_seqs = [o.sequence for _, o in port.submitted]
+    assert all(isinstance(oid, str) for _, oid in port.submitted)    # ids, not objects
+    obs_seqs = [a._feed.resolve(oid).sequence for _, oid in port.submitted]
     assert obs_seqs == [2, 3]                       # #1 was the home observation
 
 
@@ -107,7 +112,7 @@ def test_targets_come_from_the_agents_own_home_observation():
 def test_agent_stops_at_first_failure():
     a, port, _ = agent(port=FakePort("Drone1", [CommandStatus.TIMED_OUT]))
     results = asyncio.run(a.run())
-    assert len(results) == 1 and a.ended == "stopped at a: timed_out"
+    assert len(results) == 1 and a.ended == "stopped at a: timed_out (failed)"
 
 
 def test_no_observation_aborts_without_acting():
@@ -257,4 +262,41 @@ def test_home_captured_before_takeoff_is_reused_by_run():
     adapter.state["Drone1"]["alt"] = 4.0            # after takeoff
     asyncio.run(a.run())
     assert a.home is home and port.submitted[0][0].altitude_m == pytest.approx(4.2)
-    assert port.submitted[0][1].altitude_m == 4.0   # the step still acts on a fresh observation
+    acted_on = a._feed.resolve(port.submitted[0][1])
+    assert acted_on.altitude_m == 4.0               # the step still acts on a fresh observation
+
+
+def test_with_a_sampler_each_step_acts_on_a_sample_taken_after_the_previous_command():
+    """Observation cadence is independent of the agent: samplers run at a fixed rate,
+    and the agent picks the first sample received after its last command ended
+    (anything older is 'superseded' at the port)."""
+    ids = ["Drone1", "Drone2"]
+    adapter = MultiAdapter(ids)
+    rec = ListRecorder()
+    ex = ProjectAirSimExecutor(adapter, config=FAST, log=lambda *_: None)
+    agents, feeds = {}, {}
+    for vid in ids:
+        feeds[vid] = ObservationFeed(adapter, vid, recorder=rec)
+        port = ActionPort(vid, ex, feeds[vid], recorder=rec)
+        steps = [MissionStep(name, lambda obs, home, vid=vid, dn=dn: ProposedAction(
+            vehicle_id=vid, action_type=ActionType.MOVE_TO_POSITION, north_m=home.north_m + dn,
+            east_m=home.east_m, altitude_m=home.altitude_m, reason=name))
+            for name, dn in (("out", 10), ("back", 0))]
+        agents[vid] = ScriptedMissionAgent(vid, feeds[vid], port, steps, recorder=rec)
+
+    async def go():
+        for a in agents.values():
+            a.capture_home()
+        stop = asyncio.Event()
+        samplers = [asyncio.ensure_future(f.sample(50.0, stop)) for f in feeds.values()]
+        await run_all_or_cancel(a.run() for a in agents.values())
+        stop.set()
+        await asyncio.gather(*samplers)
+    asyncio.run(go())
+    assert all(a.ended == "completed" for a in agents.values()), {v: a.ended for v, a in agents.items()}
+    assert not rec.of("port_rejected")
+    for vid in ids:
+        seqs = [feeds[vid].resolve(e["observation_id"]).sequence
+                for e in rec.of("agent_step") if e["vehicle_id"] == vid]
+        total = len([e for e in rec.of("observation") if e["vehicle_id"] == vid])
+        assert seqs[0] < seqs[1] and total > 3          # the stream ran between decisions

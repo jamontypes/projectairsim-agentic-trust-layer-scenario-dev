@@ -4,9 +4,10 @@ Print a readable summary of a run log (works on incomplete runs too).
     python -m evaluation.summarize_run runs\\run_<id>.jsonl
 
 For each vehicle, every proposal is traced through the chain
-    observation (seq) -> proposal -> gate decision -> command result
+    observation (seq, age) -> proposal -> gate decision -> command result -> feedback
 using request_id and observation_id, so you can see exactly what the agent saw
-when it asked for each command, and where the drone really ended up.
+when it asked for each command, what it was told afterwards (feedback code), and
+where the drone really ended up (ground truth, evaluation side only).
 """
 import sys
 
@@ -32,34 +33,58 @@ def summarize(path) -> str:
                    f"hooks={pipe.get('attack_hooks')}")
 
     obs = {e["observation"]["observation_id"]: e for e in ev if e.get("kind") == "observation"}
-    decisions = {e["decision"]["request_id"]: e["decision"] for e in ev if e.get("kind") == "gate_decision"}
-    results = {e["result"]["request_id"]: e["result"] for e in ev if e.get("kind") == "command_result"}
-    rejected = {e["request_id"]: e for e in ev if e.get("kind") == "port_rejected"}
-    cancelled = {e["request_id"]: e for e in ev if e.get("kind") == "command_cancelled"}
-    corrections = {}
-    for e in ev:
-        if e.get("kind") == "correction":
-            corrections.setdefault(e["request_id"], []).append(e)
     steps = {e["request_id"]: e["step"] for e in ev if e.get("kind") == "agent_step"}
+    # Attach each event to the proposal it belongs to, in log order: a replayed
+    # request_id is a NEW proposal (rejected), not the original one again.
+    chains, open_ = [], {}
+    for e in ev:
+        k = e.get("kind")
+        if k == "proposal":
+            open_[(e.get("vehicle_id"), e.get("request_id"))] = c = {"proposal": e}
+            chains.append(c)
+            continue
+        rid = (e.get("decision") or e.get("result") or e.get("feedback") or e).get("request_id")
+        c = open_.get((e.get("vehicle_id"), rid))
+        if c is not None and k in ("port_rejected", "gate_decision", "gate_error", "command_result",
+                                   "command_cancelled", "command_error", "feedback"):
+            c.setdefault(k, e)
 
     vehicles = sorted({e.get("vehicle_id") for e in ev if e.get("kind") == "proposal"})
     for vid in vehicles:
         out.append(f"\n{vid}")
-        for e in ev:
-            if e.get("kind") != "proposal" or e.get("vehicle_id") != vid:
+        mine = [e for e in ev if e.get("vehicle_id") == vid]
+        n_obs = sum(1 for e in mine if e.get("kind") == "observation")
+        n_tamp = sum(1 for e in mine if e.get("kind") == "observation" and e.get("tampered_by"))
+        n_drop = sum(1 for e in mine if e.get("kind") == "observation_dropped")
+        n_err = sum(1 for e in mine if e.get("kind") == "observation_error")
+        rate = [e.get("rate_hz") for e in mine if e.get("kind") == "sampling"]
+        out.append(f"  observations: {n_obs} delivered ({n_tamp} tampered), {n_drop} dropped, "
+                   f"{n_err} errors" + (f"; sampled at {rate[0]:g} Hz" if rate else "; on demand"))
+        for c in chains:
+            e = c["proposal"]
+            if e.get("vehicle_id") != vid:
                 continue
-            rid = e["request_id"]
+            rid = e.get("request_id")
             o = obs.get(e.get("observation_id"))
-            seq = o["observation"]["sequence"] if o else "?"
-            tamper = f" TAMPERED by {o['tampered_by']}" if o and o.get("tampered_by") else ""
-            a = e["action"]
-            line = f"  {steps.get(rid, a['action_type']):<9} obs#{seq}{tamper} -> "
-            if rid in rejected:
-                line += f"PORT REJECTED: {rejected[rid]['reason']}"
+            if o and o.get("vehicle_id") != vid:
+                seq, o = f"?(a {o.get('vehicle_id')} observation)", None
             else:
-                d = decisions.get(rid)
-                line += f"gate {d['outcome']}{'' if d and d['assessed'] else ' (unassessed)'} -> " if d else "no gate decision -> "
-                r = results.get(rid)
+                seq = o["observation"]["sequence"] if o else "?"
+            tamper = f" TAMPERED by {o['tampered_by']}" if o and o.get("tampered_by") else ""
+            age = e.get("observation_age_s")
+            age_txt = f" ({age:.2f}s old)" if isinstance(age, (int, float)) else ""
+            a = e.get("action")
+            label = steps.get(rid) or (a.get("action_type", "?") if isinstance(a, dict) else "?")
+            line = f"  {label:<9} obs#{seq}{age_txt}{tamper} -> "
+            fb = (c.get("feedback") or {}).get("feedback")
+            if "port_rejected" in c:
+                rj = c["port_rejected"]
+                line += f"PORT REJECTED [{rj.get('code', '?')}]: {rj['reason']}"
+            else:
+                d = (c.get("gate_decision") or {}).get("decision")
+                line += (f"gate {d['outcome']}{'' if d['assessed'] else ' (unassessed)'} -> " if d
+                         else "gate ERROR -> " if "gate_error" in c else "no gate decision -> ")
+                r = (c.get("command_result") or {}).get("result")
                 if r:
                     line += f"{r['status']} {r['elapsed_s']:.1f}s"
                     if r.get("corrections"):
@@ -67,10 +92,16 @@ def summarize(path) -> str:
                     ft = r.get("final_truth")
                     if ft:
                         line += f"  truth N={ft['north_m']:.1f} E={ft['east_m']:.1f} alt={ft['altitude_m']:.1f}"
-                elif rid in cancelled:
+                elif "command_cancelled" in c:
                     line += "CANCELLED"
+                elif "command_error" in c:
+                    line += f"ERROR {c['command_error'].get('error')}"
+                elif fb:
+                    line += f"not executed [{fb['code']}]"
                 else:
                     line += "no result (run ended?)"
+                if r and fb:
+                    line += f"  -> told: {fb['code']}"
             out.append(line)
         end = [x for x in ev if x.get("kind") == "agent_end" and x.get("vehicle_id") == vid]
         if end:

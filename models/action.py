@@ -103,11 +103,15 @@ class CommandStatus(str, Enum):
 
 
 class CommandResult(BaseModel):
+    """The executor's full report. EVALUATION SIDE: `reason` may quote measured
+    errors and the snapshots are simulator ground truth. Agents get an
+    ActionFeedback instead (see channel/action_port.py)."""
     request_id: str
     vehicle_id: str
     action_type: ActionType
     status: CommandStatus
     reason: str = ""
+    reason_code: str = ""                   # machine-readable cause, see executor REASON_CODES
     sent_to_simulator: bool = False
     fallback_applied: str | None = None     # e.g. "hover", "land"
     corrections: int = 0                    # bounded re-sends of a position target
@@ -115,3 +119,35 @@ class CommandResult(BaseModel):
     final_snapshot: TelemetrySnapshot | None = None
     started_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     elapsed_s: float = 0.0
+
+
+class FeedbackStage(str, Enum):
+    PORT = "port"            # rejected by the action port; never reached gate or executor
+    GATE = "gate"            # stopped by the action-risk gate; never sent
+    EXECUTOR = "executor"    # reached the executor (sent or refused at preflight)
+
+
+class ActionFeedback(BaseModel):
+    """What the AGENT is told about its proposal. Everything here is either about the
+    agent's own request or a coarse completion status a real autopilot would report.
+    No positions, no measured errors, no telemetry-health detail, no exception text:
+    those come from ground truth and stay in the evaluation record (CommandResult)."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: str | None                  # None only if the action could not be read at all
+    vehicle_id: str                         # the port's vehicle
+    action_type: ActionType | None
+    observation_id: str | None
+    stage: FeedbackStage
+    status: CommandStatus
+    code: str                               # stable, small vocabulary (see action_port)
+    message: str                            # fixed text per code, or the port's / gate's own words
+    sent_to_simulator: bool = False
+    fallback: str | None = None             # "hover", "hover_failed", "none"
+    gate_outcome: str | None = None
+    gate_assessed: bool | None = None
+    elapsed_s: float = 0.0
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == CommandStatus.SUCCEEDED

@@ -6,9 +6,10 @@ the observation channel and its action port, with every event recorded.
 
 Scene: sim_config/scene_three_drones.jsonc (Drone1/2/3 spawned 3 m apart).
 
-Plumbing (Pass 5.5):
-    adapter (ground truth) -> ObservationFeed per drone -> ScriptedMissionAgent
-    agent -> ActionPort per drone -> BypassGate (no gate yet) -> executor -> drone
+Plumbing (Pass 5.6):
+    adapter (ground truth) -> ObservationFeed per drone, sampled at OBSERVATION_HZ
+    agent -> ActionPort per drone (by observation_id) -> BypassGate (no gate yet)
+          -> executor -> drone;  the agent gets ActionFeedback, never the full result
     EvaluationRecorder writes runs/run_<id>.jsonl DURING the run
 
 Each agent learns its home and state only from its own observations and can
@@ -48,6 +49,7 @@ from agent.scripted_agent import MissionStep, ScriptedMissionAgent
 from channel.action_port import ActionPort
 from channel.observation_feed import ObservationFeed
 from evaluation.recorder import EvaluationRecorder
+from evaluation.summarize_run import summarize
 from executor.projectairsim_executor import ExecutorConfig, ProjectAirSimExecutor
 from gate.action_gate import BypassGate
 from models.action import ActionType, CommandStatus, ProposedAction
@@ -69,6 +71,8 @@ MIN_SEPARATION_M = 2.0       # 3D; the 1.0 m position tolerance leaves margin at
 MIN_COVERAGE = 0.9
 MAX_GAP_S = 0.5
 SEPARATION_SAMPLE_HZ = 20
+OBSERVATION_HZ = 5.0         # agent/assessor observation stream (not the evaluator's 20 Hz truth)
+MAX_OBSERVATION_AGE_S = 10.0 # port rejects proposals based on older observations
 DESCEND_ABOVE_LAUNCH = 1.5   # descend to launch altitude + this before landing
 # (the spawn area in Blocks is ~2.7 m local, not 1.2, so this must be relative)
 STEP_NAMES = ["climb", "fan out", "turn", "return", "descend"]
@@ -185,7 +189,10 @@ def run_config() -> dict:
         "executor": asdict(ExecutorConfig()),
         "pipeline": {"observation_source": "projectairsim_ground_truth", "attack_hooks": [],
                      "trust_assessor": NoTrustAssessor.name, "action_gate": BypassGate.name,
-                     "agents": "ScriptedMissionAgent"},
+                     "agents": "ScriptedMissionAgent",
+                     "observation_sample_hz": OBSERVATION_HZ,
+                     "max_observation_age_s": MAX_OBSERVATION_AGE_S,
+                     "agent_feedback": "ActionFeedback (no ground truth)"},
     }
 
 
@@ -210,10 +217,12 @@ async def main() -> int:
 
             def on_step(vid, label):
                 phase.setdefault("steps", {})[vid] = label
+            feeds = {}
             for vid in VEHICLES:
-                feed = ObservationFeed(adapter, vid, hooks=[], assessor=NoTrustAssessor(),
-                                       recorder=recorder)
-                port = ActionPort(vid, executor, feed, gate=BypassGate(), recorder=recorder)
+                feed = feeds[vid] = ObservationFeed(adapter, vid, hooks=[],
+                                                    assessor=NoTrustAssessor(), recorder=recorder)
+                port = ActionPort(vid, executor, feed, gate=BypassGate(), recorder=recorder,
+                                  max_observation_age_s=MAX_OBSERVATION_AGE_S)
                 agents[vid] = ScriptedMissionAgent(vid, feed, port, mission_steps(vid, descend_sync),
                                                    recorder=recorder, on_step=on_step)
 
@@ -221,6 +230,7 @@ async def main() -> int:
             tracker = SeparationTracker(VEHICLES)
             mon = asyncio.create_task(monitor(adapter, stop, phase))
             sep = asyncio.create_task(sample_truth(adapter, tracker, recorder, stop, phase))
+            samplers = []
             try:
                 # Homes come from each agent's own observation ON THE GROUND. (Pass 5.5
                 # first live run captured them after takeoff, at ~4 m, so "descend to
@@ -229,6 +239,9 @@ async def main() -> int:
                 for vid in VEHICLES:
                     if agents[vid].capture_home() is None:
                         raise RuntimeError(f"{vid}: no home observation")
+                # the regular observation stream: on from before takeoff to after landing
+                samplers = [asyncio.create_task(feeds[v].sample(OBSERVATION_HZ, stop))
+                            for v in VEHICLES]
                 phase["name"] = "takeoff (all)"
                 await takeoff_all(adapter, recorder)
                 phase["name"] = "missions"
@@ -249,6 +262,8 @@ async def main() -> int:
                 stop.set()
                 await mon
                 await sep
+                for t in samplers:
+                    await t
                 tracker.finish()      # counts a gap at the end (pose stream died before shutdown)
                 collisions = {v: adapter.collision_log(v) for v in VEHICLES}
                 separation = assess(tracker, collisions, VEHICLES, MIN_SEPARATION_M,
@@ -265,10 +280,10 @@ async def main() -> int:
         for vid in VEHICLES:
             a = agents[vid]
             print(f"{vid}:  ({a.ended})")
-            for name, r in a.results:
+            for name, r in a.results:      # what the agent was told (ActionFeedback)
                 mark = "OK  " if r.status == CommandStatus.SUCCEEDED else "FAIL"
-                fix = f" [{r.corrections} corr]" if r.corrections else ""
-                print(f"  {mark} {name:<8} {r.status.value:<9} {r.elapsed_s:6.2f}s  {r.reason}{fix}")
+                print(f"  {mark} {name:<8} {r.status.value:<9} {r.elapsed_s:6.2f}s  "
+                      f"{r.code}: {r.message}")
             done = ([n for n, _ in a.results] == STEP_NAMES
                     and all(r.status == CommandStatus.SUCCEEDED for _, r in a.results))
             ok = ok and done
@@ -289,6 +304,11 @@ async def main() -> int:
         recorder.close(outcome, separation=separation.status if separation else None,
                        agents={v: a.ended for v, a in agents.items()})
         print(f"Run log: {recorder.path}  ({sum(recorder.counts.values())} events, outcome {outcome})")
+        try:   # evaluation view: corrections, ground-truth end points, separation
+            print("\n================ RUN LOG SUMMARY ================")
+            print(summarize(recorder.path))
+        except Exception as err:
+            print(f"(summary failed: {type(err).__name__}: {err})")
         print(f"Summary:  python -m evaluation.summarize_run \"{recorder.path}\"")
 
 
