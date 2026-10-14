@@ -92,39 +92,49 @@ class ActionPort:
         self._seen_requests: set[str] = set()
         self._busy: str | None = None
         self._last_end: float | None = None
+        self._last_end_seq: int | None = None
 
     @property
     def last_command_ended_host_s(self) -> float | None:
-        """When this port's previous command left the executor (host clock), or None.
-        Decide from an observation received after this (feed.current(newer_than_host_s=...))."""
+        """When this port's previous command left the executor (host clock), or None."""
         return self._last_end
+
+    @property
+    def last_command_ended_sequence(self) -> int | None:
+        """The feed's sequence number when this port's previous command left the executor,
+        or None. Decide from a later observation: feed.current(after_sequence=...)."""
+        return self._last_end_seq
 
     @property
     def supported_actions(self) -> list[str]:
         return [a.value for a in getattr(self._executor, "SUPPORTED", ())]
 
     async def submit(self, action, based_on) -> ActionFeedback:
-        raw_request_id = getattr(action, "request_id", None)
         obs_id = based_on.observation_id if isinstance(based_on, Observation) else based_on
         obs_id = obs_id if isinstance(obs_id, str) else None
         record = self._feed.resolve(obs_id)
         age = None if record is None else round(self._clock() - record.received_host_s, 3)
-        self._record("proposal", request_id=raw_request_id, observation_id=obs_id,
-                     observation_age_s=age,
-                     action=action.model_dump(mode="json") if hasattr(action, "model_dump")
-                     else repr(action))
 
-        # Re-validate: a ProposedAction can be edited after construction (pydantic does not
-        # validate on assignment), and the executor must get a copy the agent can't touch.
+        # Re-validate BEFORE recording, so the proposal, decision, result and feedback all
+        # carry the same request_id and the log holds the structured action. (A dict without
+        # a request_id gets one here.) Re-validating also matters for ProposedAction objects:
+        # pydantic does not validate on assignment, and the executor must get a copy the
+        # agent can't touch.
+        raw = action.model_dump(mode="json") if isinstance(action, ProposedAction) else action
         try:
-            if isinstance(action, ProposedAction):
-                action = ProposedAction.model_validate(action.model_dump())
-            else:
-                action = ProposedAction.model_validate(action)
+            action = ProposedAction.model_validate(
+                action.model_dump() if isinstance(action, ProposedAction) else action)
         except ValidationError as err:
+            raw_rid = raw.get("request_id") if isinstance(raw, dict) else None
+            raw_rid = raw_rid if isinstance(raw_rid, str) else None
+            self._record("proposal", request_id=raw_rid, observation_id=obs_id,
+                         observation_age_s=age, action=raw if isinstance(raw, dict) else repr(raw),
+                         valid=False)
             msg = "; ".join(e["msg"] for e in err.errors())
             return self._reject(None, obs_id, "invalid_action", f"action is not valid: {msg}",
-                                request_id=raw_request_id)
+                                request_id=raw_rid)
+        self._record("proposal", request_id=action.request_id, observation_id=obs_id,
+                     observation_age_s=age, action=action.model_dump(mode="json"), valid=True)
 
         rid = action.request_id
         if action.vehicle_id != self.vehicle_id:
@@ -151,7 +161,7 @@ class ActionPort:
             return self._reject(action, obs_id, "observation_expired",
                                 f"observation is {age:.1f} s old (limit "
                                 f"{self.max_observation_age_s:.1f} s); observe again")
-        if self._last_end is not None and record.received_host_s <= self._last_end:
+        if self._last_end_seq is not None and record.sequence <= self._last_end_seq:
             return self._reject(action, obs_id, "observation_superseded",
                                 "observation was received before your previous command ended; "
                                 "observe again")
@@ -199,6 +209,7 @@ class ActionPort:
             raise
         finally:
             self._last_end = self._clock()
+            self._last_end_seq = self._feed.last_sequence
         self._record("command_result", observation_id=obs_id, decision_id=decision.decision_id,
                      observation_age_at_dispatch_s=round(started - record.received_host_s, 3),
                      result=summarize_result(result))

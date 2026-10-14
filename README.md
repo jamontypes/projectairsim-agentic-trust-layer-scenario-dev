@@ -68,7 +68,8 @@ don't.
 | 5.4 | Cancellation survives repeated Ctrl+C and cancels each drone's task once (takeoff included); separation counts only fresh, in-sync samples and reports INCONCLUSIVE on poor coverage | done |
 | 5.5 | Observation feed (verdict stripped, attack hooks before assessment, receiver-stamped ids), vehicle-bound action port (ownership, observation linkage, no replays, explicit gate bypass), JSONL evaluation recorder written during the run; three-drone demo runs through agents, with a sync point before descending; agents capture home on the ground before takeoff; altitude tolerance 0.5 m (Simple Flight accuracy) | done |
 | 5.6a | Interface hardening for external (LLM) agents: agent-facing `ActionFeedback` (no ground truth, fixed codes; full `CommandResult` evaluation side only, executor `reason_code`), proposals by `observation_id` resolved to frozen, feed-protected records, freshness and supersession checks, one command in flight per drone, fixed-rate observation sampling with history | done (offline) |
-| 5.6b | Gemini pilot for one drone through the same feed/port (provider-replaceable) | next |
+| 5.6b | LLM pilot agent (`agent/llm_pilot.py`): tools `get_observation` / `submit_action`, final comment, bounded turns / submissions / time, model retries, provider interface (`agent/providers/`) with Gemini; dict proposals recorded with one request_id; protected copies from `resolve()` and to the assessor; supersession by feed sequence (Windows clock resolution) | offline done; live next |
+| 5.7 | Three independent LLM pilots | planned |
 | later | Trust assessor (scores + per-check results), action-risk gate with escalation, peer broadcasts, attack scenarios; `move_along_track`, `takeoff`, `land` | planned |
 
 ## Setup (Windows)
@@ -84,6 +85,18 @@ don't.
    ```powershell
    <path>\Blocks-Windows-1.0.1\Blocks.exe -windowed -ResX=1280 -ResY=720
    ```
+
+LLM pilot (Gemini): `pip install google-genai`, then put these in the repo's `.env`
+(gitignored; never commit a key):
+```
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-3.5-flash-lite,gemini-3.6-flash   # preference order; first that answers is used
+# GEMINI_RPM=60                                        # only after enabling billing
+```
+`python check_gemini.py --list-models` lists the models a key can use. Requests are
+paced client-side at ~80% of the free-tier per-minute limit (one limiter per model,
+shared by every pilot), and each action costs one model call (the result carries the
+next observation).
 
 Scene and robot configs are vendored in `sim_config/` (copied from the
 Project AirSim v1.0.1 samples), so no sibling checkout is required.
@@ -101,6 +114,8 @@ All commands from the repo root.
 | `python test_adapter_live.py [--fly]` | yes | Snapshots at 2 Hz, optionally during a flight |
 | `python test_executor_live.py` | yes | Executor: takeoff (setup), rotate +90 deg, climb 2 m, safe shutdown |
 | `python test_multi_drone_live.py` | yes | Three drones (scene_three_drones.jsonc), each flown by a scripted agent through its own feed and port: climb to separate layers, fan out, turn, return, (wait for all) descend, land. Writes `runs/run_<id>.jsonl`. PASS also requires >= 2 m separation between every pair, no drone-to-drone collisions or impacts, and adequate telemetry coverage (otherwise the separation verdict is INCONCLUSIVE, which fails the run) |
+| `python check_gemini.py [--slow-first 12]` | no | Gemini key/model/tool calling and the whole agent loop against a fake drone; `--slow-first` delays the first action past the observation expiry |
+| `python test_llm_pilot_live.py [--model M] [--task "..."]` | yes | One drone (scene_basic_drone.jsonc) flown by a Gemini pilot through its feed and port; takeoff/landing are setup/shutdown, not the agent's; prints every action, the agent's final comment and the run summary |
 | `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone observation stream counts and chain observation (age) -> proposal -> gate decision -> result -> feedback code, shutdowns, separation; works on incomplete runs |
 | `python telemetry_explorer.py` | yes | Dumps every non-camera topic to `telemetry_dump.json` |
 
@@ -149,6 +164,9 @@ channel/action_port.py              per-drone action port (the agent's only outp
 trust/assessor.py                   trust assessor interface + NoTrustAssessor placeholder
 gate/action_gate.py                 action-risk gate interface + BypassGate placeholder
 agent/scripted_agent.py             ScriptedMissionAgent (fixed steps, no decision logic)
+agent/llm_pilot.py                  LLMPilot: model <-> tools loop for one drone, limits, recording
+agent/providers/                    model-provider interface (base.py) and Gemini (gemini.py)
+utils/env.py                        load the repo's .env (API keys) without printing it
 evaluation/recorder.py              JSONL run log written during the run; read_run()
 evaluation/summarize_run.py         readable run summary
 sim_config/                         scene + robot configs

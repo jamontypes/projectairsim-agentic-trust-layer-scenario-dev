@@ -49,7 +49,9 @@ def summarize(path) -> str:
                                    "command_cancelled", "command_error", "feedback"):
             c.setdefault(k, e)
 
-    vehicles = sorted({e.get("vehicle_id") for e in ev if e.get("kind") == "proposal"})
+    vehicles = sorted({e.get("vehicle_id") for e in ev
+                       if e.get("kind") in ("proposal", "llm_session", "agent_end")
+                       and e.get("vehicle_id")})
     for vid in vehicles:
         out.append(f"\n{vid}")
         mine = [e for e in ev if e.get("vehicle_id") == vid]
@@ -103,6 +105,28 @@ def summarize(path) -> str:
                 if r and fb:
                     line += f"  -> told: {fb['code']}"
             out.append(line)
+        sess = [x for x in mine if x.get("kind") == "llm_session"]
+        if sess:
+            turns = [x for x in mine if x.get("kind") == "llm_turn"]
+            lat = [t["latency_s"] for t in turns if isinstance(t.get("latency_s"), (int, float))]
+            tok_in = sum((t.get("usage") or {}).get("prompt_token_count") or 0 for t in turns)
+            tok_out = sum((t.get("usage") or {}).get("candidates_token_count") or 0 for t in turns)
+            errs = sum(1 for x in mine if x.get("kind") == "llm_error")
+            tools = [x for x in mine if x.get("kind") == "tool_call"]
+            out.append(f"  llm: {sess[0].get('provider')}:{sess[0].get('model')}, {len(turns)} turns"
+                       + (f", latency mean {sum(lat) / len(lat):.1f}s max {max(lat):.1f}s" if lat else "")
+                       + f", tokens in {tok_in} out {tok_out}, {len(tools)} tool calls, "
+                       f"{errs} model errors")
+            seen_err = {}
+            for x in mine:
+                if x.get("kind") == "llm_error":
+                    key = f"{x.get('error')}: {str(x.get('detail', ''))[:120]}"
+                    seen_err[key] = seen_err.get(key, 0) + 1
+            for k, n in seen_err.items():
+                out.append(f"  ! model error x{n}: {k}")
+            for x in mine:
+                if x.get("kind") == "agent_comment":
+                    out.append(f"  comment: {x.get('text')}")
         end = [x for x in ev if x.get("kind") == "agent_end" and x.get("vehicle_id") == vid]
         if end:
             out.append(f"  agent: {end[-1]['ended']}")

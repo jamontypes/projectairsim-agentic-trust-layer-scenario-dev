@@ -3,6 +3,9 @@ projectairsim==1.0.2
 pydantic>=2,<3
 pytest>=8
 
+# LLM pilot agent (Pass 5.6b): Gemini through the Google Gen AI SDK
+google-genai
+
 # Enabled when observability / the agent are wired in (observability.py):
 # logfire
 # pydantic-ai

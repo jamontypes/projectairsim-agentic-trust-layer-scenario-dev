@@ -251,9 +251,11 @@ def test_observation_from_before_the_previous_command_ended_is_superseded():
     stale = feed.observe()                                  # also taken before the command
     assert submit(port, turn(), before.observation_id).succeeded
     assert port.last_command_ended_host_s == pytest.approx(103.0)
+    assert port.last_command_ended_sequence == 2
     fb = submit(port, turn(), stale.observation_id)
     assert fb.code == "observation_superseded" and len(ex.calls) == 1
-    clock.t += 0.1
+    # same clock reading as the command's end (coarse Windows clock): still fresh by sequence
+    clock.t = port.last_command_ended_host_s
     assert submit(port, turn(), feed.observe().observation_id).succeeded
 
 
@@ -374,3 +376,52 @@ def test_port_and_feed_must_belong_to_the_same_vehicle():
     adapter = SnapAdapter()
     with pytest.raises(ValueError):
         ActionPort("Drone1", FakeExecutor(), ObservationFeed(adapter, "Drone2"))
+
+
+# ------------------------------------------------------------ evaluation linkage for dict actions
+def test_dict_action_is_recorded_structured_with_one_request_id_throughout():
+    port, feed, _, _, rec, _ = make()
+    fb = submit(port, {"request_id": "llm-request-1", "vehicle_id": "Drone1",
+                       "action_type": "rotate_to_heading", "heading_deg": 90.0, "reason": "x"},
+                feed.observe().observation_id)
+    assert fb.succeeded and fb.request_id == "llm-request-1"
+    p = rec.of("proposal")[0]
+    assert p["request_id"] == "llm-request-1" and p["valid"] is True
+    assert isinstance(p["action"], dict) and p["action"]["heading_deg"] == 90.0
+    assert rec.of("gate_decision")[0]["decision"]["request_id"] == "llm-request-1"
+    assert rec.of("command_result")[0]["result"]["request_id"] == "llm-request-1"
+
+
+def test_dict_action_without_request_id_gets_one_shared_by_every_record():
+    port, feed, _, _, rec, _ = make()
+    fb = submit(port, {"vehicle_id": "Drone1", "action_type": "rotate_to_heading",
+                       "heading_deg": 90.0, "reason": "x"}, feed.observe().observation_id)
+    rid = fb.request_id
+    assert rid and rec.of("proposal")[0]["request_id"] == rid
+    assert rec.of("command_result")[0]["result"]["request_id"] == rid
+
+
+def test_invalid_dict_action_is_recorded_as_given_and_marked_invalid():
+    port, feed, _, _, rec, _ = make()
+    bad = {"request_id": "llm-request-2", "vehicle_id": "Drone1", "action_type": "fly_away",
+           "reason": "x"}
+    fb = submit(port, bad, feed.observe().observation_id)
+    p = rec.of("proposal")[0]
+    assert fb.code == "invalid_action" and fb.request_id == "llm-request-2"
+    assert p["valid"] is False and p["action"] == bad and p["request_id"] == "llm-request-2"
+    assert rec.of("port_rejected")[0]["request_id"] == "llm-request-2"
+
+
+def test_summarizer_links_a_dict_action_through_to_its_result(tmp_path):
+    from evaluation.recorder import EvaluationRecorder
+    from evaluation.summarize_run import summarize
+    adapter, clock = SnapAdapter(), Clock()
+    rec = EvaluationRecorder(run_config={}, run_dir=tmp_path)
+    feed = ObservationFeed(adapter, "Drone1", recorder=rec, clock=clock)
+    port = ActionPort("Drone1", FakeExecutor(), feed, recorder=rec)
+    submit(port, {"request_id": "llm-request-3", "vehicle_id": "Drone1",
+                  "action_type": "rotate_to_heading", "heading_deg": 90.0, "reason": "x"},
+           feed.observe().observation_id)
+    rec.close("pass")
+    text = summarize(rec.path)
+    assert "rotate_to_heading obs#1" in text and "succeeded" in text and "told: completed" in text

@@ -85,8 +85,9 @@ class FakeDrone:
         return await self._command("rotate_to_yaw",
                                    lambda: setattr(self.world, "target_heading", heading))
 
-    async def move_to_position_async(self, north, east, down, velocity, timeout_sec=None):
+    async def move_to_position_async(self, north, east, down, velocity, timeout_sec=None, **yaw):
         self.last_move = (north, east, down, velocity)
+        self.last_move_yaw = yaw
         def apply():
             dn, de, da = self.world.misses.pop(0) if self.world.misses else (0.0, 0.0, 0.0)
             self.world.target_alt = -down + da
@@ -590,3 +591,18 @@ def test_every_reason_code_used_in_tests_is_declared():
     src = inspect.getsource(sys.modules[__name__])
     used = set(re.findall(r'r\.reason_code == "(\w+)"', src))
     assert used and used <= set(REASON_CODES)
+
+
+@pytest.mark.parametrize("hold", [False, True])
+def test_move_heading_hold_option_sends_the_start_heading(hold):
+    from dataclasses import replace
+    world, drone, ex = setup()
+    ex.config = replace(ex.config, move_hold_heading=hold)
+    world.heading = 315.0
+    r = run(ex.execute(move()))
+    assert r.status == CommandStatus.SUCCEEDED, r.reason
+    if hold:
+        assert drone.last_move_yaw["yaw_is_rate"] is False
+        assert drone.last_move_yaw["yaw"] == pytest.approx(math.radians(-45.0))
+    else:
+        assert drone.last_move_yaw == {}

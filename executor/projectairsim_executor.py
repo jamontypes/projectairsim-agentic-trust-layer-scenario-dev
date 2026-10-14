@@ -76,6 +76,11 @@ class ExecutorConfig:
     correction_stall_s: float = 1.0              # stopped-but-off for this long (sim time)
     correction_max_speed_mps: float = 0.35       # "stopped" means total speed <= this
     correction_speed_mps: float = 1.0
+    # Heading during position/altitude moves. Project AirSim's default (yaw_is_rate=True,
+    # yaw=0) only holds yaw RATE, so the nose can drift. Live diag (2026-10-14): at headings
+    # 315 / 45 a 10 m move overshot and then orbited the target (~1 m, 0.6-0.7 m/s) without
+    # settling; at 0 / 90 it settled. True = command the start heading explicitly.
+    move_hold_heading: bool = False
     heading: HeadingTolerance = field(default_factory=HeadingTolerance)
     altitude: AltitudeTolerance = field(default_factory=AltitudeTolerance)
     position: PositionTolerance = field(default_factory=PositionTolerance)
@@ -175,12 +180,19 @@ class ProjectAirSimExecutor:
         dz = abs(action.altitude_m - start.altitude_local_m)
         return dz / self._altitude_speed(action) + self.config.altitude_task_margin_s
 
+    def _yaw_kw(self, start) -> dict:
+        """Extra move_to_position arguments: hold the heading the command started with."""
+        if not self.config.move_hold_heading:
+            return {}
+        return {"yaw_is_rate": False,
+                "yaw": math.radians(((start.heading_deg + 180.0) % 360.0) - 180.0)}
+
     async def _start_altitude(self, drone, action, start):
         # Hold the north/east captured BEFORE dispatch.
         return await drone.move_to_position_async(
             north=start.position_ned_m.x, east=start.position_ned_m.y,
             down=-action.altitude_m, velocity=self._altitude_speed(action),
-            timeout_sec=self._altitude_task_timeout(action, start))
+            timeout_sec=self._altitude_task_timeout(action, start), **self._yaw_kw(start))
 
     def _settle_altitude(self, snap, action, start):
         return altitude_settled(snap, action.altitude_m, start.position_ned_m.x,
@@ -199,7 +211,7 @@ class ProjectAirSimExecutor:
         return await drone.move_to_position_async(
             north=action.north_m, east=action.east_m, down=-action.altitude_m,
             velocity=self._move_speed(action),
-            timeout_sec=self._move_task_timeout(action, start))
+            timeout_sec=self._move_task_timeout(action, start), **self._yaw_kw(start))
 
     def _correction_timeout(self, snap, n, e, alt) -> float:
         dist = math.sqrt((n - snap.position_ned_m.x) ** 2 + (e - snap.position_ned_m.y) ** 2
@@ -210,14 +222,15 @@ class ProjectAirSimExecutor:
         speed = min(self.config.correction_speed_mps, self._move_speed(action))
         return await drone.move_to_position_async(
             north=action.north_m, east=action.east_m, down=-action.altitude_m, velocity=speed,
-            timeout_sec=self._correction_timeout(now, action.north_m, action.east_m, action.altitude_m))
+            timeout_sec=self._correction_timeout(now, action.north_m, action.east_m, action.altitude_m),
+            **self._yaw_kw(start))
 
     async def _correct_altitude(self, drone, action, start, now):
         speed = min(self.config.correction_speed_mps, self._altitude_speed(action))
         n, e = start.position_ned_m.x, start.position_ned_m.y   # still the ORIGINAL hold point
         return await drone.move_to_position_async(
             north=n, east=e, down=-action.altitude_m, velocity=speed,
-            timeout_sec=self._correction_timeout(now, n, e, action.altitude_m))
+            timeout_sec=self._correction_timeout(now, n, e, action.altitude_m), **self._yaw_kw(start))
 
     def _settle_move(self, snap, action, start):
         return position_settled(snap, action.north_m, action.east_m, action.altitude_m,

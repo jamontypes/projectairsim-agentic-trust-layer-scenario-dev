@@ -72,7 +72,7 @@ class ScriptedMissionAgent:
                                          f"broken by {step.sync.broken_by}")
                 self._on_step(self.vehicle_id, step.name)
                 obs = await self._feed.current(
-                    newer_than_host_s=getattr(self._port, "last_command_ended_host_s", None))
+                    after_sequence=getattr(self._port, "last_command_ended_sequence", None))
                 if obs is None:
                     return self._end(f"aborted at {step.name}: no observation")
                 try:

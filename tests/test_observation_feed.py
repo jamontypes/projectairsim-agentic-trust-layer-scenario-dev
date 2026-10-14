@@ -218,14 +218,14 @@ def test_current_waits_for_a_sample_newer_than_the_given_time():
         stop = asyncio.Event()
         task = asyncio.ensure_future(feed.sample(20.0, stop))
         await asyncio.sleep(0.12)
-        boundary = feed.clock()
-        newer = await feed.current(newer_than_host_s=boundary, timeout_s=1.0)
+        boundary = feed.last_sequence
+        newer = await feed.current(after_sequence=boundary, timeout_s=1.0)
         any_ = await feed.current()
         stop.set()
         await task
         return boundary, newer, any_
     boundary, newer, any_ = asyncio.run(go())
-    assert newer is not None and newer.received_host_s > boundary
+    assert newer is not None and newer.sequence > boundary
     assert any_ is not None
 
 
@@ -247,7 +247,7 @@ def test_current_without_a_sampler_observes_now():
     import asyncio
     adapter = SnapAdapter()
     feed = ObservationFeed(adapter, "Drone1")
-    obs = asyncio.run(feed.current(newer_than_host_s=1e12))
+    obs = asyncio.run(feed.current(after_sequence=10**9))
     assert obs is not None and adapter.calls == 1
 
 
@@ -289,3 +289,30 @@ def test_missing_or_malformed_fields_read_as_nan_not_defaults():
     _, _, feed = make(hooks=[wreck])
     obs = feed.observe()
     assert math.isnan(obs.north_m) and math.isnan(obs.altitude_m)
+
+
+def test_resolved_copies_cannot_change_the_record_or_later_reads():
+    _, _, feed = make()
+    obs = feed.observe()
+    got = feed.resolve(obs.observation_id)
+    got.payload["position_ned_m"]["x"] = 999.0
+    assert feed.resolve(obs.observation_id).north_m == 1.0
+    assert feed.latest().north_m == 1.0 and feed.history()[-1].north_m == 1.0
+
+
+def test_assessor_cannot_change_the_record_or_its_history():
+    class Vandal:
+        name = "vandal"
+
+        def assess(self, obs, previous):
+            obs.payload["altitude_local_m"] = -50.0
+            if previous is not None:
+                previous.payload["altitude_local_m"] = -60.0
+            return TrustAssessment(observation_id=obs.observation_id, assessor="vandal",
+                                   assessed=True, status=TrustStatus.TRUSTED)
+    _, rec, feed = make(assessor=Vandal())
+    a, b = feed.observe(), feed.observe()
+    assert [o.altitude_m for o in feed.history()] == [6.0, 6.0]
+    assert feed.resolve(a.observation_id).altitude_m == 6.0 == b.altitude_m
+    assert all(e["observation"]["payload"]["altitude_local_m"] == 6.0
+               for e in rec.of("observation"))
