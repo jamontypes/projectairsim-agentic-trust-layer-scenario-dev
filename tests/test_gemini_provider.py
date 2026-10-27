@@ -1,5 +1,5 @@
 """GeminiProvider's mapping logic against a stand-in for the google-genai SDK
-(the real SDK and network are exercised by check_gemini.py, live)."""
+(the real SDK and network are exercised by check_llm.py --harness native, live)."""
 import asyncio
 from types import SimpleNamespace
 

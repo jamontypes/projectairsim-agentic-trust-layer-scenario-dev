@@ -162,22 +162,39 @@ Rules:
    final comment: what you did, the outcome of each action, and anything unexpected."""
 
 
-class LLMPilot:
-    def __init__(self, vehicle_id: str, feed, port, provider, task: str, recorder=None,
+class PilotCore:
+    """Everything a pilot agent shares, whatever runs the model: the launch point, the two
+    tools (executed against the agent's own feed and port) and the recording. Subclasses
+    supply the model loop: LLMPilot (this repo's own loop) and PydanticPilot (Pydantic AI)."""
+
+    def __init__(self, vehicle_id: str, feed, port, task: str, recorder=None,
                  limits: PilotLimits = PilotLimits(), rules: FlightRules = FlightRules(),
-                 clock=None, sleep=asyncio.sleep, on_step=None):
+                 clock=None, on_step=None):
         if feed.vehicle_id != vehicle_id or port.vehicle_id != vehicle_id:
             raise ValueError("feed and port must belong to the pilot's own vehicle")
         self.vehicle_id = vehicle_id
-        self._feed, self._port, self._provider = feed, port, provider
+        self._feed, self._port = feed, port
         self._task, self._recorder = task, recorder
         self.limits, self.rules = limits, rules
         self._clock = clock or feed.clock
-        self._sleep = sleep
         self._on_step = on_step or (lambda vid, label: None)
         self.home: Observation | None = None
         self.outcome = PilotOutcome()
         self._n_requests = 0
+        self._recorded_calls: set[str] = set()
+
+    def prompts(self) -> tuple[str, str, list[ToolSpec]]:
+        """(system prompt, task message, tool specs) for this pilot."""
+        supported = self._port.supported_actions
+        return (system_prompt(self.vehicle_id, supported, self._port.max_observation_age_s,
+                              self.rules),
+                self.task_message(), tool_specs(supported))
+
+    def record_session(self, provider: str, model: str, system: str, intro: str,
+                       tools: list[ToolSpec], **extra) -> None:
+        self._event("llm_session", provider=provider, model=model, system=system, task=intro,
+                    tools=[asdict(t) for t in tools], limits=asdict(self.limits),
+                    rules=asdict(self.rules), **extra)
 
     # ------------------------------------------------------------ public
     def capture_home(self) -> Observation | None:
@@ -196,84 +213,6 @@ class LLMPilot:
         return (f"Launch point (your own observation on the ground, before takeoff): {where}.\n"
                 f"You are airborne now.\nTask: {self._task}")
 
-    async def run(self) -> PilotOutcome:
-        out = self.outcome
-        supported = self._port.supported_actions
-        tools = tool_specs(supported)
-        system = system_prompt(self.vehicle_id, supported, self._port.max_observation_age_s,
-                               self.rules)
-        intro = self.task_message()
-        self._event("llm_session", provider=getattr(self._provider, "name", "?"),
-                    model=getattr(self._provider, "model", "?"), system=system, task=intro,
-                    tools=[asdict(t) for t in tools], limits=asdict(self.limits),
-                    rules=asdict(self.rules))
-        started = self._clock()
-        try:
-            session = self._provider.start(system=system, tools=tools)
-            turn = await self._ask(session, lambda: session.send_user(intro), started)
-            while turn is not None:
-                if not turn.tool_calls:
-                    out.comment = turn.text.strip() or None
-                    self._event("agent_comment", text=out.comment)
-                    return self._end("completed" if out.comment else "ended without a comment")
-                if out.model_turns >= self.limits.max_model_turns:
-                    return self._end(f"stopped: model turn limit ({self.limits.max_model_turns})")
-                results = [await self._run_tool(c) for c in turn.tool_calls]
-                turn = await self._ask(session, lambda: session.send_tool_results(results),
-                                       started)
-            return self._end(out.ended if out.ended.startswith("stopped") else
-                             "stopped: model unavailable")
-        except BaseException as err:
-            out.ended = f"interrupted: {type(err).__name__}"
-            self._event("agent_end", ended=out.ended, model_turns=out.model_turns,
-                        submissions=len(out.submissions))
-            raise
-
-    # ------------------------------------------------------------ model calls
-    async def _ask(self, session, call, started) -> ModelTurn | None:
-        lim = self.limits
-        wait_turn = getattr(session, "wait_turn", None)
-        for attempt in range(lim.model_retries + 1):
-            remaining = lim.time_budget_s - (self._clock() - started)
-            if remaining <= 0:
-                self.outcome.ended = f"stopped: time budget ({lim.time_budget_s:g} s)"
-                return None
-            if wait_turn is not None:            # quota pacing, outside the model timeout
-                waited = await wait_turn()
-                if waited > 0:
-                    self._event("llm_rate_wait", waited_s=round(waited, 3))
-                    if waited >= 1.0:
-                        self._on_step(self.vehicle_id, f"waited {waited:.1f} s for model quota")
-                remaining = lim.time_budget_s - (self._clock() - started)
-                if remaining <= 0:
-                    self.outcome.ended = f"stopped: time budget ({lim.time_budget_s:g} s)"
-                    return None
-            self._on_step(self.vehicle_id, "thinking")
-            t0 = self._clock()
-            try:
-                turn = await asyncio.wait_for(call(), min(lim.model_timeout_s, remaining))
-            except asyncio.CancelledError:
-                raise
-            except Exception as err:
-                kind = "timeout" if isinstance(err, asyncio.TimeoutError) else type(err).__name__
-                self._event("llm_error", attempt=attempt + 1, error=kind,
-                            detail=str(err)[:500], latency_s=round(self._clock() - t0, 3))
-                if attempt < lim.model_retries:
-                    wait = min(lim.retry_backoff_s * 2 ** attempt, lim.retry_backoff_max_s)
-                    code = getattr(err, "code", None)
-                    self._on_step(self.vehicle_id, f"model error {code or kind}; retry "
-                                  f"{attempt + 1}/{lim.model_retries} in {wait:g} s")
-                    await self._sleep(wait)
-                continue
-            self.outcome.model_turns += 1
-            self._event("llm_turn", turn=self.outcome.model_turns,
-                        latency_s=round(self._clock() - t0, 3), text=turn.text,
-                        tool_calls=[asdict(c) for c in turn.tool_calls], usage=turn.usage,
-                        finish_reason=turn.finish_reason)
-            return turn
-        self.outcome.ended = f"stopped: model call failed {lim.model_retries + 1} times"
-        return None
-
     # ------------------------------------------------------------ tools
     async def _run_tool(self, call: ToolCall) -> ToolResult:
         try:
@@ -290,6 +229,7 @@ class LLMPilot:
             self._event("tool_error", call_id=call.call_id, name=call.name,
                         error=f"{type(err).__name__}: {err}")
             result = {"ok": False, "error": "internal error while running the tool"}
+        self._recorded_calls.add(call.call_id)
         self._event("tool_call", call_id=call.call_id, name=call.name, args=call.args,
                     result=result)
         return ToolResult(call.call_id, call.name, result)
@@ -340,6 +280,95 @@ class LLMPilot:
                     succeeded=self.outcome.succeeded_actions)
         return self.outcome
 
+    def _interrupted(self, err: BaseException) -> None:
+        self.outcome.ended = f"interrupted: {type(err).__name__}"
+        self._event("agent_end", ended=self.outcome.ended, model_turns=self.outcome.model_turns,
+                    submissions=len(self.outcome.submissions))
+
     def _event(self, kind, **fields):
         if self._recorder is not None:
             self._recorder.record(kind, vehicle_id=self.vehicle_id, **fields)
+
+
+class LLMPilot(PilotCore):
+    """Framework-free reference pilot: this repo's own model loop over a ModelProvider
+    (agent/providers/). Kept as the baseline harness next to PydanticPilot."""
+
+    def __init__(self, vehicle_id: str, feed, port, provider, task: str, recorder=None,
+                 limits: PilotLimits = PilotLimits(), rules: FlightRules = FlightRules(),
+                 clock=None, sleep=asyncio.sleep, on_step=None):
+        super().__init__(vehicle_id, feed, port, task, recorder=recorder, limits=limits,
+                         rules=rules, clock=clock, on_step=on_step)
+        self._provider = provider
+        self._sleep = sleep
+
+    async def run(self) -> PilotOutcome:
+        out = self.outcome
+        system, intro, tools = self.prompts()
+        self.record_session(getattr(self._provider, "name", "?"),
+                            getattr(self._provider, "model", "?"), system, intro, tools,
+                            harness="native")
+        started = self._clock()
+        try:
+            session = self._provider.start(system=system, tools=tools)
+            turn = await self._ask(session, lambda: session.send_user(intro), started)
+            while turn is not None:
+                if not turn.tool_calls:
+                    out.comment = turn.text.strip() or None
+                    self._event("agent_comment", text=out.comment)
+                    return self._end("completed" if out.comment else "ended without a comment")
+                if out.model_turns >= self.limits.max_model_turns:
+                    return self._end(f"stopped: model turn limit ({self.limits.max_model_turns})")
+                results = [await self._run_tool(c) for c in turn.tool_calls]
+                turn = await self._ask(session, lambda: session.send_tool_results(results),
+                                       started)
+            return self._end(out.ended if out.ended.startswith("stopped") else
+                             "stopped: model unavailable")
+        except BaseException as err:
+            self._interrupted(err)
+            raise
+
+    # ------------------------------------------------------------ model calls
+    async def _ask(self, session, call, started) -> ModelTurn | None:
+        lim = self.limits
+        wait_turn = getattr(session, "wait_turn", None)
+        for attempt in range(lim.model_retries + 1):
+            remaining = lim.time_budget_s - (self._clock() - started)
+            if remaining <= 0:
+                self.outcome.ended = f"stopped: time budget ({lim.time_budget_s:g} s)"
+                return None
+            if wait_turn is not None:            # quota pacing, outside the model timeout
+                waited = await wait_turn()
+                if waited > 0:
+                    self._event("llm_rate_wait", waited_s=round(waited, 3))
+                    if waited >= 1.0:
+                        self._on_step(self.vehicle_id, f"waited {waited:.1f} s for model quota")
+                remaining = lim.time_budget_s - (self._clock() - started)
+                if remaining <= 0:
+                    self.outcome.ended = f"stopped: time budget ({lim.time_budget_s:g} s)"
+                    return None
+            self._on_step(self.vehicle_id, "thinking")
+            t0 = self._clock()
+            try:
+                turn = await asyncio.wait_for(call(), min(lim.model_timeout_s, remaining))
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                kind = "timeout" if isinstance(err, asyncio.TimeoutError) else type(err).__name__
+                self._event("llm_error", attempt=attempt + 1, error=kind,
+                            detail=str(err)[:500], latency_s=round(self._clock() - t0, 3))
+                if attempt < lim.model_retries:
+                    wait = min(lim.retry_backoff_s * 2 ** attempt, lim.retry_backoff_max_s)
+                    code = getattr(err, "code", None)
+                    self._on_step(self.vehicle_id, f"model error {code or kind}; retry "
+                                  f"{attempt + 1}/{lim.model_retries} in {wait:g} s")
+                    await self._sleep(wait)
+                continue
+            self.outcome.model_turns += 1
+            self._event("llm_turn", turn=self.outcome.model_turns,
+                        latency_s=round(self._clock() - t0, 3), text=turn.text,
+                        tool_calls=[asdict(c) for c in turn.tool_calls], usage=turn.usage,
+                        finish_reason=turn.finish_reason)
+            return turn
+        self.outcome.ended = f"stopped: model call failed {lim.model_retries + 1} times"
+        return None

@@ -3,9 +3,8 @@ projectairsim==1.0.2
 pydantic>=2,<3
 pytest>=8
 
-# LLM pilot agent (Pass 5.6b): Gemini through the Google Gen AI SDK
-google-genai
-
-# Enabled when observability / the agent are wired in (observability.py):
-# logfire
-# pydantic-ai
+# LLM pilot agents
+# Pydantic AI (any model: Ollama / OpenAI-compatible via the openai extra, Gemini via google)
+pydantic-ai-slim[openai,google]>=2.62,<3
+google-genai               # also used directly by the native reference harness
+logfire                    # optional tracing (observability.py), on when LOGFIRE_TOKEN is set

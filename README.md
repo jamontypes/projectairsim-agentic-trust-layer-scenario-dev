@@ -70,7 +70,8 @@ don't.
 | 5.6a | Interface hardening for external (LLM) agents: agent-facing `ActionFeedback` (no ground truth, fixed codes; full `CommandResult` evaluation side only, executor `reason_code`), proposals by `observation_id` resolved to frozen, feed-protected records, freshness and supersession checks, one command in flight per drone, fixed-rate observation sampling with history | done (offline) |
 | 5.6b | LLM pilot agent (`agent/llm_pilot.py`): tools `get_observation` / `submit_action`, final comment, bounded turns / submissions / time, model retries, provider interface (`agent/providers/`) with Gemini; dict proposals recorded with one request_id; protected copies from `resolve()` and to the assessor; supersession by feed sequence (Windows clock resolution) | offline done; live next |
 | 5.6c | Executor velocity final approach (default): Simple Flight's position hold orbited the target (~1 m, 0.6-0.7 m/s, never settling) at diagonal headings 315/45; holding the heading explicitly did not help; steering in with velocity commands settled at 315/45/0 in ~9.4 s with < 0.05 m/s residual motion (`diag_heading_settle.py`) | done (diag); demo rerun next |
-| 5.7 | Three independent LLM pilots | planned |
+| 5.6d | Pydantic AI harness (default): any model via one setting (`LLM_MODEL`: Ollama, OpenAI-compatible, Gemini), pacing and transient-error retries below the framework, optional Logfire tracing; same prompt, tools, port and recording as the reference `LLMPilot` (`PilotCore`); schema-rejected tool calls recorded | offline done; live next |
+| next | Phase 0 of the scenario roadmap: Remote ID broadcast bus, maneuver actions and continuous-flight port rules, mission runner (velocity path following), corridor scene, mission tools | planned |
 | later | Trust assessor (scores + per-check results), action-risk gate with escalation, peer broadcasts, attack scenarios; `move_along_track`, `takeoff`, `land` | planned |
 
 ## Setup (Windows)
@@ -87,17 +88,26 @@ don't.
    <path>\Blocks-Windows-1.0.1\Blocks.exe -windowed -ResX=1280 -ResY=720
    ```
 
-LLM pilot (Gemini): `pip install google-genai`, then put these in the repo's `.env`
-(gitignored; never commit a key):
+LLM pilots run on Pydantic AI, so any model is one setting. `pip install -r
+requirements.txt`, then put these in the repo's `.env` (gitignored; never commit a key):
 ```
-GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-3.5-flash-lite,gemini-3.6-flash   # preference order; first that answers is used
-# GEMINI_RPM=60                                        # only after enabling billing
+# preference order; the first model that answers the preflight ping is used
+LLM_MODEL=ollama:qwen3.5:9b,google:gemini-3.5-flash-lite
+OLLAMA_BASE_URL=http://localhost:11434/v1     # or the GPU box, e.g. http://192.168.1.50:11434/v1
+GEMINI_API_KEY=...                            # only for google:* models
+# LLM_RPM=60                                  # request pacing; default: Gemini free tier, none for local
+# LOGFIRE_TOKEN=...                           # turns on Logfire tracing of every model and tool call
 ```
-`python check_gemini.py --list-models` lists the models a key can use. Requests are
-paced client-side at ~80% of the free-tier per-minute limit (one limiter per model,
-shared by every pilot), and each action costs one model call (the result carries the
-next observation).
+`python check_llm.py --list-models` lists what the server behind `LLM_MODEL` offers.
+Requests are paced client-side (one limiter per model, shared by every pilot) and
+transient errors (overload, rate limit, 5xx, connection) are retried below the agent
+framework (`agent/model_config.py`). Each action costs one model call: the action's
+result carries the next observation.
+
+Local models (Ollama): Ollama's default context window is small, and a pilot's
+conversation reaches 10-20k tokens. Raise it on the server (e.g. `OLLAMA_CONTEXT_LENGTH=32768`
+before `ollama serve`, or `num_ctx` in a Modelfile); otherwise the model silently loses
+the start of its mission.
 
 Scene and robot configs are vendored in `sim_config/` (copied from the
 Project AirSim v1.0.1 samples), so no sibling checkout is required.
@@ -115,8 +125,8 @@ All commands from the repo root.
 | `python test_adapter_live.py [--fly]` | yes | Snapshots at 2 Hz, optionally during a flight |
 | `python test_executor_live.py` | yes | Executor: takeoff (setup), rotate +90 deg, climb 2 m, safe shutdown |
 | `python test_multi_drone_live.py` | yes | Three drones (scene_three_drones.jsonc), each flown by a scripted agent through its own feed and port: climb to separate layers, fan out, turn, return, (wait for all) descend, land. Writes `runs/run_<id>.jsonl`. PASS also requires >= 2 m separation between every pair, no drone-to-drone collisions or impacts, and adequate telemetry coverage (otherwise the separation verdict is INCONCLUSIVE, which fails the run) |
-| `python check_gemini.py [--slow-first 12]` | no | Gemini key/model/tool calling and the whole agent loop against a fake drone; `--slow-first` delays the first action past the observation expiry |
-| `python test_llm_pilot_live.py [--model M] [--task "..."]` | yes | One drone (scene_basic_drone.jsonc) flown by a Gemini pilot through its feed and port; takeoff/landing are setup/shutdown, not the agent's; prints every action, the agent's final comment and the run summary |
+| `python check_llm.py [--harness pydantic\|native] [--model SPEC] [--slow-first 12]` | no | Model, tool calling and the whole agent loop against a fake drone; `--slow-first` delays the first action past the observation expiry; `--model test` runs Pydantic AI's built-in test model (no network) |
+| `python test_llm_pilot_live.py [--harness pydantic\|native] [--model SPEC] [--task "..."]` | yes | One drone (scene_basic_drone.jsonc) flown by an LLM pilot through its feed and port; takeoff/landing are setup/shutdown, not the agent's; prints every action, the agent's final comment and the run summary |
 | `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone observation stream counts and chain observation (age) -> proposal -> gate decision -> result -> feedback code, shutdowns, separation; works on incomplete runs |
 | `python telemetry_explorer.py` | yes | Dumps every non-camera topic to `telemetry_dump.json` |
 
@@ -165,8 +175,12 @@ channel/action_port.py              per-drone action port (the agent's only outp
 trust/assessor.py                   trust assessor interface + NoTrustAssessor placeholder
 gate/action_gate.py                 action-risk gate interface + BypassGate placeholder
 agent/scripted_agent.py             ScriptedMissionAgent (fixed steps, no decision logic)
-agent/llm_pilot.py                  LLMPilot: model <-> tools loop for one drone, limits, recording
-agent/providers/                    model-provider interface (base.py) and Gemini (gemini.py)
+agent/llm_pilot.py                  PilotCore (prompt, tools, recording) + LLMPilot (own loop, reference harness)
+agent/pydantic_pilot.py             PydanticPilot: the same pilot on Pydantic AI (default harness)
+agent/model_config.py               model from LLM_MODEL (any backend), pacing + retries, preflight ping
+agent/pilot_setup.py                choose harness + model, preflight, build pilots
+agent/providers/                    native harness: provider interface (base.py), Gemini (gemini.py), RateLimiter
+observability.py                    optional Logfire tracing (LOGFIRE_TOKEN)
 utils/env.py                        load the repo's .env (API keys) without printing it
 evaluation/recorder.py              JSONL run log written during the run; read_run()
 evaluation/summarize_run.py         readable run summary

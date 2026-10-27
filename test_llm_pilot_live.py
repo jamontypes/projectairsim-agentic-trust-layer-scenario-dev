@@ -1,15 +1,19 @@
 """
-One drone flown by a Gemini pilot agent in Project AirSim (Pass 5.6b).
+One drone flown by an LLM pilot agent in Project AirSim.
 
-    python .\\test_llm_pilot_live.py [--model MODEL] [--task "..."]
+    python .\\test_llm_pilot_live.py [--harness pydantic|native] [--model SPEC] [--task "..."]
 
-Run check_gemini.py first (same agent loop, fake drone, no simulator).
-Needs Blocks running, `pip install google-genai`, GEMINI_API_KEY (environment
-or the repo's .env) and optionally GEMINI_MODEL.
+    --harness pydantic (default)  Pydantic AI, any model: --model / LLM_MODEL, e.g.
+                                  "ollama:qwen3.5:9b" or "google:gemini-3.5-flash-lite"
+    --harness native              this repo's own Gemini loop (GEMINI_MODEL, bare names)
+
+Run check_llm.py first (same agent loop, fake drone, no simulator). Keys and model
+settings go in the repo's .env (see README). Logfire tracing turns on if
+LOGFIRE_TOKEN is set.
 
 Pipeline (same interfaces as the scripted agents):
-    adapter (ground truth) -> ObservationFeed (5 Hz) -> LLMPilot tools -> Gemini
-    Gemini -> submit_action -> ActionPort -> BypassGate (no gate) -> executor -> drone
+    adapter (ground truth) -> ObservationFeed (5 Hz) -> pilot tools -> model
+    model -> submit_action -> ActionPort -> BypassGate (no gate) -> executor -> drone
     the model gets ActionFeedback only; everything is recorded in runs/run_<id>.jsonl
 
 Setup and shutdown are NOT the agent's: takeoff is a recorded setup step (direct
@@ -28,8 +32,8 @@ import time
 from dataclasses import asdict
 
 from adapters.projectairsim_adapter import ProjectAirSimAdapter
-from agent.llm_pilot import FlightRules, LLMPilot, PilotLimits
-from agent.providers import pick_gemini
+from agent.llm_pilot import FlightRules, PilotLimits
+from agent.pilot_setup import HARNESSES, prepare_pilot
 from channel.action_port import ActionPort
 from channel.observation_feed import ObservationFeed
 from evaluation.recorder import EvaluationRecorder
@@ -37,6 +41,7 @@ from evaluation.summarize_run import summarize
 from executor.projectairsim_executor import ExecutorConfig, ProjectAirSimExecutor
 from gate.action_gate import BypassGate
 from models.telemetry import GroundState, ValidationStatus
+from observability import configure_observability
 from trust.assessor import NoTrustAssessor
 from utils.flight_safety import safe_shutdown
 
@@ -112,28 +117,29 @@ async def takeoff(adapter, recorder):
 
 
 async def main(args) -> int:
+    traced = configure_observability()
     # Preflight BEFORE connecting to the simulator: nothing takes off unless a model answers.
-    print("checking model availability...")
+    print(f"harness {args.harness}; checking model availability...")
     try:
-        provider, tried = await pick_gemini(args.model)
+        setup = await prepare_pilot(args.harness, args.model)
     except RuntimeError as err:
         print(f"\nNOT FLYING: {err}")
         return 2
     task = args.task or TASK
-    print(f"provider {provider.name}, model {provider.model}")
+    print(f"model {setup.label}" + ("  (Logfire tracing on)" if traced else ""))
     recorder = EvaluationRecorder(run_config={
         "script": "test_llm_pilot_live.py", "scene": SCENE, "vehicles": [VEHICLE], "task": task,
-        "model": {"provider": provider.name, "model": provider.model,
-                  "temperature": provider.temperature, "preflight": tried},
+        "model": {**setup.config, "preflight": setup.preflight, "logfire": traced},
         "limits": asdict(LIMITS), "rules_told_to_model": asdict(RULES),
         "executor": asdict(ExecutorConfig()),
         "pipeline": {"observation_source": "projectairsim_ground_truth", "attack_hooks": [],
                      "trust_assessor": NoTrustAssessor.name, "action_gate": BypassGate.name,
-                     "agents": f"LLMPilot({provider.name}:{provider.model})",
+                     "agents": f"{setup.harness} pilot ({setup.label})",
                      "observation_sample_hz": OBSERVATION_HZ,
                      "max_observation_age_s": MAX_OBSERVATION_AGE_S,
                      "agent_feedback": "ActionFeedback (no ground truth)"}})
     print(f"Recording to {recorder.path}")
+    setup.attach_recorder(recorder)
     phase = {"name": "connect"}
     outcome, out, report = "aborted", None, None
     try:
@@ -150,8 +156,8 @@ async def main(args) -> int:
             def on_step(vid, label):
                 phase["name"] = f"agent: {label}"
                 print(f"  [{time.strftime('%H:%M:%S')}] agent: {label}")
-            pilot = LLMPilot(VEHICLE, feed, port, provider, task=task, recorder=recorder,
-                             limits=LIMITS, rules=RULES, on_step=on_step)
+            pilot = setup.make(VEHICLE, feed, port, task, recorder=recorder, limits=LIMITS,
+                               rules=RULES, on_step=on_step)
 
             stop = asyncio.Event()
             mon = asyncio.create_task(monitor(adapter, stop, phase))
@@ -201,6 +207,7 @@ async def main(args) -> int:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    ap.add_argument("--harness", choices=HARNESSES, default="pydantic")
     ap.add_argument("--model", default=None)
     ap.add_argument("--task", default=None)
     sys.exit(asyncio.run(main(ap.parse_args())))

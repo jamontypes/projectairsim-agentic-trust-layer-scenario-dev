@@ -112,19 +112,28 @@ def summarize(path) -> str:
         if sess:
             turns = [x for x in mine if x.get("kind") == "llm_turn"]
             lat = [t["latency_s"] for t in turns if isinstance(t.get("latency_s"), (int, float))]
-            tok_in = sum((t.get("usage") or {}).get("prompt_token_count") or 0 for t in turns)
-            tok_out = sum((t.get("usage") or {}).get("candidates_token_count") or 0 for t in turns)
-            errs = sum(1 for x in mine if x.get("kind") == "llm_error")
+            # usage keys: native Gemini harness vs Pydantic AI
+            def tok(t, *keys):
+                u = t.get("usage") or {}
+                return next((u[k] for k in keys if u.get(k) is not None), 0)
+            tok_in = sum(tok(t, "prompt_token_count", "input_tokens") for t in turns)
+            tok_out = sum(tok(t, "candidates_token_count", "output_tokens") for t in turns)
+            # model errors are per agent (native harness) or per shared model (Pydantic AI)
+            errs_ev = [x for x in ev if x.get("kind") == "llm_error"
+                       and (x.get("vehicle_id") == vid or x.get("source") == "model")]
             tools = [x for x in mine if x.get("kind") == "tool_call"]
-            out.append(f"  llm: {sess[0].get('provider')}:{sess[0].get('model')}, {len(turns)} turns"
+            rejected_args = sum(1 for x in mine if x.get("kind") == "tool_rejected")
+            harness = sess[0].get("harness")
+            out.append(f"  llm: {sess[0].get('provider')}:{sess[0].get('model')}"
+                       + (f" [{harness}]" if harness else "") + f", {len(turns)} turns"
                        + (f", latency mean {sum(lat) / len(lat):.1f}s max {max(lat):.1f}s" if lat else "")
-                       + f", tokens in {tok_in} out {tok_out}, {len(tools)} tool calls, "
-                       f"{errs} model errors")
+                       + f", tokens in {tok_in} out {tok_out}, {len(tools)} tool calls"
+                       + (f" (+{rejected_args} rejected by schema)" if rejected_args else "")
+                       + f", {len(errs_ev)} model errors")
             seen_err = {}
-            for x in mine:
-                if x.get("kind") == "llm_error":
-                    key = f"{x.get('error')}: {str(x.get('detail', ''))[:120]}"
-                    seen_err[key] = seen_err.get(key, 0) + 1
+            for x in errs_ev:
+                key = f"{x.get('error')}: {str(x.get('detail', ''))[:120]}"
+                seen_err[key] = seen_err.get(key, 0) + 1
             for k, n in seen_err.items():
                 out.append(f"  ! model error x{n}: {k}")
             for x in mine:
