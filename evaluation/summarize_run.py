@@ -43,7 +43,10 @@ def summarize(path) -> str:
             open_[(e.get("vehicle_id"), e.get("request_id"))] = c = {"proposal": e}
             chains.append(c)
             continue
-        rid = (e.get("decision") or e.get("result") or e.get("feedback") or e).get("request_id")
+        # the request_id sits in a nested record for some kinds; other events may use the
+        # same field names for plain values (e.g. final_approach result="settled")
+        nested = [e.get(k) for k in ("decision", "result", "feedback") if isinstance(e.get(k), dict)]
+        rid = (nested[0] if nested else e).get("request_id")
         c = open_.get((e.get("vehicle_id"), rid))
         if c is not None and k in ("port_rejected", "gate_decision", "gate_error", "command_result",
                                    "command_cancelled", "command_error", "feedback"):

@@ -132,3 +132,19 @@ def test_real_executor_events_reach_the_file(tmp_path):
     corr = read_run(r.path).of_kind("correction")
     assert len(corr) == 1 and corr[0]["request_id"] == a.request_id
     assert corr[0]["source"] == "executor" and corr[0]["n"] == 1
+
+
+def test_summary_survives_events_whose_result_field_is_plain_text(tmp_path):
+    """Live 2026-10-27: the executor's final_approach event has result="settled" (a string);
+    the summarizer crashed treating every 'result' as a nested record."""
+    from evaluation.recorder import EvaluationRecorder
+    from evaluation.summarize_run import summarize
+    rec = EvaluationRecorder(run_config={}, run_dir=tmp_path)
+    rec.record("proposal", vehicle_id="Drone1", request_id="r1", observation_id="o1",
+               action={"action_type": "move_to_position"})
+    rec.record("final_approach", vehicle_id="Drone1", request_id="r1", result="settled", commands=12)
+    rec.record("command_result", vehicle_id="Drone1", observation_id="o1",
+               result={"request_id": "r1", "status": "succeeded", "elapsed_s": 9.4})
+    rec.close("pass")
+    text = summarize(rec.path)
+    assert "move_to_position" in text and "succeeded 9.4s" in text
