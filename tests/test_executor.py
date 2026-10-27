@@ -17,8 +17,11 @@ from models.action import ActionType, CommandStatus, ProposedAction
 from models.telemetry import (GroundState, Quaternion, TelemetrySnapshot, ValidationStatus,
                               Vector3)
 
+# final_approach="none": most tests here exercise the corrections path (Simple Flight's own
+# position hold). The velocity final approach, the live default, has its own tests below.
 FAST = ExecutorConfig(poll_interval_s=0.01, invoke_timeout_s=0.2, rotate_task_timeout_s=0.5,
-                      altitude_task_margin_s=0.5, settle_timeout_s=0.5, hover_timeout_s=0.2)
+                      altitude_task_margin_s=0.5, settle_timeout_s=0.5, hover_timeout_s=0.2,
+                      final_approach="none")
 
 
 class FakeWorld:
@@ -666,3 +669,14 @@ def test_velocity_final_approach_times_out_and_hovers():
     r = run(ex.execute(move(0.0, -3.0, 6.0)))
     assert r.status == CommandStatus.TIMED_OUT and r.reason_code == "settle_timeout"
     assert "velocity final approach" in r.reason and r.fallback_applied == "hover"
+
+
+def test_velocity_final_approach_is_the_default():
+    """Live diag 3: Simple Flight's position hold orbits at diagonal headings; the
+    velocity final approach settled at 315, 45 and 0 deg."""
+    assert ExecutorConfig().final_approach == "velocity"
+
+
+def test_unknown_final_approach_is_rejected():
+    with pytest.raises(ValueError, match="final_approach"):
+        ExecutorConfig(final_approach="velocty")

@@ -12,8 +12,13 @@ Every command follows the same lifecycle:
                    polling telemetry (~10 Hz) so telemetry loss is caught mid-command.
     4. SETTLE      wait until the completion predicate holds continuously for its
                    dwell (SIM time), bounded by a second host-time deadline.
-                   Position commands only: if the vehicle has STOPPED outside
-                   tolerance, re-send the target slowly (bounded corrections).
+                   Position/altitude commands, default (final_approach="velocity"):
+                   once off target, steer in with world-frame velocity commands
+                   (v = gain * error, clamped) until settled, then hover. Simple
+                   Flight's own position hold orbits the target at diagonal headings
+                   (diag_heading_settle.py, 2026-10-14/27). With final_approach="none":
+                   if the vehicle has STOPPED outside tolerance, re-send the target
+                   slowly (bounded corrections).
     5. RESULT      CommandResult. On any failure after dispatch, hover first.
 
 Outcome mapping
@@ -86,7 +91,7 @@ class ExecutorConfig:
     #   "velocity"  close the loop ourselves: every poll, command a world-frame velocity
     #               toward the target, v = gain * error (clamped, zero inside the deadband),
     #               then hover once settled. Replaces the corrections.
-    final_approach: str = "none"
+    final_approach: str = "velocity"     # diag 3 (2026-10-27): settles at 315/45/0 deg, ~9.4 s
     approach_gain_per_s: float = 0.8
     approach_max_speed_mps: float = 1.0
     approach_max_vertical_mps: float = 0.5
@@ -95,6 +100,11 @@ class ExecutorConfig:
     heading: HeadingTolerance = field(default_factory=HeadingTolerance)
     altitude: AltitudeTolerance = field(default_factory=AltitudeTolerance)
     position: PositionTolerance = field(default_factory=PositionTolerance)
+
+    def __post_init__(self):
+        if self.final_approach not in ("none", "velocity"):   # a typo must not change flight
+            raise ValueError(f"final_approach must be 'none' or 'velocity', "
+                             f"not {self.final_approach!r}")
 
 
 # CommandResult.reason_code values. `reason` is free text for people (it quotes
