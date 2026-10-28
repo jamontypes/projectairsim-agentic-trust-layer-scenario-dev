@@ -1,0 +1,276 @@
+"""MissionPilot: wake-up rules, tools, and a 5-drone conflict scenario on the fake
+simulator with 2 model-driven drones (Pydantic AI FunctionModel) + 3 scripted ones."""
+import asyncio
+import json
+import math
+import os
+from dataclasses import replace
+
+import pytest
+
+os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
+
+from pydantic_ai.messages import (ModelResponse, TextPart, ToolCallPart,  # noqa: E402
+                                  ToolReturnPart, UserPromptPart)
+from pydantic_ai.models.function import FunctionModel  # noqa: E402
+
+from agent.mission_pilot import MissionPilot, MissionPilotConfig  # noqa: E402
+from channel.action_port import ActionPort  # noqa: E402
+from channel.observation_feed import ObservationFeed  # noqa: E402
+from channel.remote_id import RemoteIdBroadcaster, RemoteIdBus, RemoteIdReceiver  # noqa: E402
+from conflict.detection import PairPrediction  # noqa: E402
+from executor.mission_runner import MissionRunner  # noqa: E402
+from executor.path_follower import FollowerConfig, FollowMode  # noqa: E402
+from executor.projectairsim_executor import ProjectAirSimExecutor  # noqa: E402
+from models.mission import MissionPlan  # noqa: E402
+from tests.channel_fakes import ListRecorder  # noqa: E402
+from tests.test_executor import FAST, MultiAdapter  # noqa: E402
+
+PLAN = MissionPlan.load("missions/inspection_5_conflict.json")
+LLM = ("Drone2", "Drone3")
+FOLLOW = FollowerConfig(poll_interval_s=0.005, hover_timeout_s=0.5)
+FAST_PILOT = MissionPilotConfig(check_every_s=0.005, recheck_s=0.3, off_nominal_clear_s=0.1,
+                                min_episode_gap_s=0.02, monitor_max_s=0.05)
+
+
+def situation_in(messages):
+    """The wake-up message's situation JSON (first user prompt of this episode)."""
+    for m in messages:
+        for p in getattr(m, "parts", ()):
+            if isinstance(p, UserPromptPart):
+                text = p.content if isinstance(p.content, str) else str(p.content)
+                return text.split("\n", 1)[0], json.loads(text.split("Situation now:\n", 1)[1])
+    return None, None
+
+
+class LayerPolicy:
+    """A sensible model: on a conflict, move to an escape layer; when clear, go back."""
+
+    def __init__(self, escape_m):
+        self.escape_m = escape_m
+
+    def __call__(self, messages, info):
+        if any(isinstance(p, ToolReturnPart) for p in messages[-1].parts):
+            return ModelResponse(parts=[TextPart("Done.")])
+        head, sit = situation_in(messages)
+        oid = sit["own_state"]["observation_id"]
+        layer = sit["mission"]["assigned_layer_m"]
+        if "back_to_plan" in head:
+            target = layer
+        elif sit.get("safe_layers_m"):      # follow the advice when given, as the prompt asks
+            target = sit["safe_layers_m"][0]
+        elif "safe_layers_m" in sit:        # advice given but no layer is safe: timed hold
+            return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
+                "observation_id": oid, "maneuver": "hold", "duration_s": 3.0,
+                "reason": f"{head}: no safe layer, hold"})])
+        else:
+            target = self.escape_m
+        return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
+            "observation_id": oid, "maneuver": "change_altitude", "altitude_m": target,
+            "reason": f"{head}: layer {target}"})])
+
+
+def scenario(policies, config=FAST_PILOT):
+    ids = PLAN.vehicle_ids
+    adapter, rec = MultiAdapter(ids), ListRecorder()
+    for vid in ids:
+        n, e = PLAN.for_vehicle(vid).corridor.waypoints[0]
+        w = adapter.worlds[vid]
+        w.n, w.e, w.alt = n, e, 4.0
+    ex = ProjectAirSimExecutor(adapter, config=FAST, log=lambda *_: None)
+    bus = RemoteIdBus(recorder=rec)
+    runners, pilots, tx, feeds = {}, {}, {}, {}
+    for vid in ids:
+        m = PLAN.for_vehicle(vid)
+        feeds[vid] = ObservationFeed(adapter, vid, recorder=rec)
+        rx = bus.attach(RemoteIdReceiver(vid, recorder=rec))
+        tx[vid] = RemoteIdBroadcaster(adapter, vid, bus, recorder=rec)
+        runners[vid] = MissionRunner(adapter, m, ex, follower_config=FOLLOW, log=lambda *_: None,
+                                     on_event=lambda k, f: rec.record(k, source="mission", **f))
+        if vid in policies:
+            port = ActionPort(vid, runners[vid], feeds[vid], recorder=rec, max_observation_age_s=5.0)
+            pilots[vid] = MissionPilot(vid, feeds[vid], port, rx, m, FunctionModel(policies[vid]),
+                                       recorder=rec, config=config, model_label="function")
+    truth = []
+
+    async def go():
+        stop = asyncio.Event()
+        bg = [asyncio.ensure_future(t.run(400.0, stop)) for t in tx.values()]
+
+        async def sample():
+            while not stop.is_set():
+                truth.append({v: (w.n, w.e, w.alt) for v, w in adapter.worlds.items()})
+                await asyncio.sleep(0.002)
+        bg.append(asyncio.ensure_future(sample()))
+        pl = [asyncio.ensure_future(p.run(stop)) for p in pilots.values()]
+        results = await asyncio.wait_for(
+            asyncio.gather(*(r.fly(timeout_s=60) for r in runners.values())), 60)
+        stop.set()
+        await asyncio.gather(*bg, *pl)
+        return dict(zip(runners, results))
+    results = asyncio.run(go())
+    return results, pilots, rec, truth, adapter
+
+
+def min_sep(truth, a, b):
+    best = math.inf
+    for t in truth:
+        (n1, e1, z1), (n2, e2, z2) = t[a], t[b]
+        best = min(best, math.dist((n1, e1, z1), (n2, e2, z2)))
+    return best
+
+
+# ------------------------------------------------------------ the scenario
+def test_llm_drones_resolve_head_on_conflicts_and_return_to_their_layer():
+    results, pilots, rec, truth, adapter = scenario(
+        {"Drone2": LayerPolicy(escape_m=13.0), "Drone3": LayerPolicy(escape_m=17.0)})
+    assert all(r.mode == FollowMode.DONE for r in results.values()), \
+        {v: (r.mode, r.reason) for v, r in results.items()}
+    for vid in LLM:
+        wakes = [e["reason"] for e in rec.of("agent_wake") if e["vehicle_id"] == vid]
+        assert wakes[0] == "new_conflict" and "back_to_plan" in wakes, (vid, wakes)
+        applied = [m for m in pilots[vid].maneuvers if m["code"] == "applied"]
+        assert len(applied) >= 2, (vid, pilots[vid].maneuvers)
+        # it went back to its own layer at least once (Drone2/Drone4 meet again on the
+        # return legs, so a drone may legitimately finish its corridor on the escape layer)
+        layer = PLAN.for_vehicle(vid).corridor.altitude_m
+        backs = [c for c in rec.of("tool_call") if c["vehicle_id"] == vid
+                 and c["name"] == "propose_maneuver" and c["args"].get("altitude_m") == layer
+                 and c["result"]["feedback"]["code"] == "applied"]
+        assert backs, vid
+    # No ground-truth separation check here: the fake moves a drone ~0.3 m per follower tick
+    # whatever the clock says (tens of m/s in real time), so warning times are not to scale.
+    # The decisions are what this tests; separation is checked live.
+    # an applied maneuver ends the wake-up: one model call, its reason is the comment
+    for vid in LLM:
+        for w in [e for e in rec.of("agent_wake") if e["vehicle_id"] == vid]:
+            turns = [t for t in rec.of("llm_turn") if t["vehicle_id"] == vid
+                     and t["episode"] == w["episode"]]
+            assert len(turns) == 1, (vid, w["episode"], len(turns))
+        assert all(c and c.split(":")[0] in ("change_altitude", "hold") for c in pilots[vid].comments)
+    first = [e for e in rec.of("agent_wake") if e["vehicle_id"] == "Drone2"][0]
+    assert first["conflicts"][0]["with"] == "Drone4"                   # detected from Remote ID
+    assert not rec.of("tool_rejected")
+
+
+def test_without_resolution_the_pairs_lose_separation():
+    """The baseline the gate will matter for: a model that only maintains."""
+    def maintain(messages, info):
+        if any(isinstance(p, ToolReturnPart) for p in messages[-1].parts):
+            return ModelResponse(parts=[TextPart("Maintaining.")])
+        _, sit = situation_in(messages)
+        return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
+            "observation_id": sit["own_state"]["observation_id"], "maneuver": "maintain",
+            "reason": "carry on"})])
+    results, pilots, rec, truth, adapter = scenario({"Drone2": maintain, "Drone3": maintain})
+    assert min_sep(truth, "Drone2", "Drone4") < 2.0
+    assert [m["code"] for m in pilots["Drone2"].maneuvers][0] == "applied"
+
+
+# ------------------------------------------------------------ wake-up rules
+def P(other, t_los):
+    return PairPrediction(other, 20.0, 0.0, t_los + 2, 0.0, 0.0, t_los, t_los + 4, False)
+
+
+def make_pilot():
+    ids = ("Drone2",)
+    adapter = MultiAdapter(ids)
+    feed = ObservationFeed(adapter, "Drone2")
+    rx = RemoteIdReceiver("Drone2")
+    m = PLAN.for_vehicle("Drone2")
+    port = ActionPort("Drone2", object(), feed)
+    return MissionPilot("Drone2", feed, port, rx, m, FunctionModel(lambda m, i: None),
+                        config=MissionPilotConfig(recheck_s=8, off_nominal_clear_s=6,
+                                                  min_episode_gap_s=2))
+
+
+def test_wake_rules():
+    p = make_pilot()
+    sit = lambda conflicts, now: {"conflicts": conflicts, "now": now}     # noqa: E731
+    assert p._wake_reason(sit([], 0.0)) is None                           # nothing to do
+    assert p._wake_reason(sit([P("Drone4", 40.0)], 1.0)) is None          # too far ahead
+    assert p._wake_reason(sit([P("Drone4", 10.0)], 2.0)) == "new_conflict"
+    p._handled, p._last_episode_end = {"Drone4"}, 2.0
+    assert p._wake_reason(sit([P("Drone4", 9.0)], 3.0)) is None           # handled, gap
+    assert p._wake_reason(sit([P("Drone4", 9.0)], 5.0)) is None           # handled, < recheck
+    assert p._wake_reason(sit([P("Drone4", 3.0)], 10.5)) == "conflict_persists"
+    assert p._wake_reason(sit([P("Drone4", 3.0), P("Drone5", 9)], 11.0)) == "new_conflict"
+    p._handled, p._last_episode_end = {"Drone4", "Drone5"}, 11.0
+    p.altitude_target_m = 12.0                                             # off its layer
+    assert p._wake_reason(sit([], 12.0)) is None                          # clear just now
+    assert p._wake_reason(sit([], 18.5)) == "back_to_plan"
+    p._handled = {"Drone4"}
+    p.altitude_target_m = 10.0
+    assert p._wake_reason(sit([], 30.0)) is None                          # on plan: nothing
+    assert p._handled == set()                                            # cleared pairs forgotten
+
+
+# ------------------------------------------------------------ tools
+def test_tools_monitor_diff_and_expired_observation_hint():
+    seen = []
+    state = {"n": 0}
+
+    def fn(messages, info):
+        state["n"] += 1
+        last = messages[-1]
+        res = [p.content for p in last.parts if isinstance(p, ToolReturnPart)]
+        seen.extend(res)
+        if state["n"] == 1:
+            _, sit = situation_in(messages)
+            return ModelResponse(parts=[
+                ToolCallPart("get_mission", {}), ToolCallPart("get_traffic", {}),
+                ToolCallPart("get_conflicts", {}), ToolCallPart("monitor", {"seconds": 99}),
+                ToolCallPart("propose_maneuver", {"observation_id": "stale-id",
+                                                  "maneuver": "hold", "reason": "test"})])
+        return ModelResponse(parts=[TextPart("ok")])
+    results, pilots, rec, truth, adapter = scenario({"Drone2": fn})
+    mission, traffic, conflicts, monitor, propose = seen[:5]
+    assert mission["mission"]["assigned_layer_m"] == 10.0
+    assert {p["uas_id"] for p in traffic["traffic"]["peers"]} <= set(PLAN.vehicle_ids) - {"Drone2"}
+    assert "predicted_conflicts" in conflicts
+    assert monitor["waited_s"] == FAST_PILOT.monitor_max_s and "conflicts" in monitor
+    assert propose["feedback"]["code"] == "unknown_observation" and "next_step" in propose
+    text = json.dumps(seen)
+    for leak in ("truth", "true_sender", "clean_payload", "snapshot"):
+        assert leak not in text
+
+
+def test_back_to_plan_is_not_suggested_while_the_assigned_layer_is_in_conflict():
+    from conflict.detection import Track
+    p = make_pilot()
+    p._last_episode_end, p.altitude_target_m = 0.0, 13.0          # escaped to 13
+    own = Track("Drone2", 10, 0, 13, 0, 1.0, 0)
+    oncoming_at_layer = Track("Drone4", 10, 15, 10, 0, -1.0, 0)   # head-on on layer 10
+    sit = {"conflicts": [], "now": 20.0, "own": own, "peers": [oncoming_at_layer]}
+    p._clear_since = 10.0
+    assert p._wake_reason(sit) is None                            # going back would conflict
+    sit["peers"] = [Track("Drone4", 10, -15, 10, 0, -1.0, 0)]    # passed, but only 15 m away
+    assert p._wake_reason(sit) is None                            # near the layer: not yet
+    sit["peers"] = [Track("Drone4", 10, -20, 10, 0, -1.0, 0)]    # 20 m away and diverging
+    assert p._wake_reason(sit) == "back_to_plan"
+
+
+def test_safe_layers_keep_the_margin_from_nearby_drones_and_avoid_projected_conflicts():
+    from conflict.detection import Track
+    p = make_pilot()                                    # Drone2: band 5-20, layer 10
+    own = Track("Drone2", 10, 0, 10, 0, 1.0, 0)
+    peers = [Track("Drone4", 10, 15, 10, 0, -1.0, 0),   # head-on on layer 10
+             Track("Drone5", 12, 3, 14, 0, 0, 0),       # hovering nearby at 14
+             Track("Far", 100, 100, 7, 0, 0, 0)]        # far away: does not constrain
+    layers = p.safe_layers({"own": own, "peers": peers})
+    assert layers and all(abs(a - 10) >= 3 and abs(a - 14) >= 3 for a in layers)
+    assert layers[0] == 7.0                             # closest acceptable to 10 first
+    assert all(5 <= a <= 20 for a in layers) and len(layers) <= 5
+
+
+def test_escapes_follow_the_safe_layer_advice_and_keep_the_margin():
+    results, pilots, rec, truth, adapter = scenario(
+        {"Drone2": LayerPolicy(escape_m=13.0), "Drone3": LayerPolicy(escape_m=17.0)})
+    for vid in LLM:
+        layer = PLAN.for_vehicle(vid).corridor.altitude_m
+        escapes = [c["args"]["altitude_m"] for c in rec.of("tool_call")
+                   if c["vehicle_id"] == vid and c["name"] == "propose_maneuver"
+                   and c["args"].get("altitude_m") not in (None, layer)]
+        assert escapes, vid
+        others = {10.0, 14.0, 6.0}                          # every planned layer
+        assert all(min(abs(a - o) for o in others) >= 3 for a in escapes), (vid, escapes)

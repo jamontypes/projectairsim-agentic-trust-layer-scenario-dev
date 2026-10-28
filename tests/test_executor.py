@@ -98,7 +98,9 @@ class FakeDrone:
         return await self._command("move_to_position", apply)
 
     async def hover_async(self):
-        return await self._command("hover", lambda: None)
+        def stop():
+            self.world.vn = self.world.ve = self.world.vs = 0.0
+        return await self._command("hover", stop)
 
     async def move_by_velocity_async(self, v_north, v_east, v_down, duration=0.001, **yaw):
         self.velocities = getattr(self, "velocities", []) + [(v_north, v_east, v_down)]
@@ -109,6 +111,8 @@ class FakeDrone:
         self.calls.append("move_by_velocity")
         w.target_ne = (w.n + v_north * duration, w.e + v_east * duration)
         w.target_alt = w.alt - v_down * duration
+        # report the commanded velocity (conflict detection projects with it)
+        w.vn, w.ve, w.vs = v_north, v_east, -v_down
         done = asyncio.get_running_loop().create_future()
         done.set_result(None)
         return done

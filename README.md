@@ -74,7 +74,8 @@ don't.
 | 0.a | Velocity path follower (`executor/path_follower.py`): continuous polyline flight by pure pursuit, live maneuvers (hold = brake then stay, resume, altitude, speed, stop), fail-safe hover; live diag at 3 m/s: 2.90 m/s on straights, 0.22 m median cross-track (1.15 m out of corners), no orbit after arrival. Python 3.11 `asyncio.wait_for` could swallow a cancellation: replaced by `asyncio.timeout` in executor, feed, follower, native pilot | done (hold fix: live recheck) |
 | 0.b | Remote ID broadcast channel (`channel/remote_id.py`): honest 1 Hz broadcasters, bus, per-drone receivers keyed by CLAIMED id, sender hooks (malicious drone: lie, impersonate, Sybil, drop) and link hooks (in transit), assessor slot per stream, agent traffic view with unverified free text | done (offline) |
 | 0.c | Mission layer: maneuver actions (`maintain`, `hold` [optional duration], `resume`, `change_speed`, `change_altitude` as a layer change); `MissionRunner` (climb to layer, fly the corridor with the path follower, apply maneuvers via the port: applied / not_applicable / out_of_range / not_flying / mission_finished); mission files (`missions/inspection_5.json`: 5 crossing corridors on separate layers) and `scene_inspection_5.jsonc`; `ScriptedManeuverAgent` (own observations + corridor + Remote ID traffic, maneuvers through the port); 5-drone offline integration test | offline done; live next |
-| next | Phase 0: LLM mission agents on the corridor scenario (tools `get_own_state`, `get_traffic`, `get_mission`, `propose_maneuver`; event-driven wake-ups), top-down track plot | planned |
+| 0.d | Conflict detection (`conflict/detection.py`: linear projection, TCPA/DCPA/time to loss of separation, 5 m / 2 m minima; Kuchar & Yang, Atlas ideas, no Atlas code), `MissionPilot` LLM mission agent (deterministic watch loop wakes the model on new / persisting conflicts or to return to plan; tools own state, traffic, conflicts, mission, real-time `monitor` diff, `propose_maneuver`; what-if check of the assigned layer), conflict mission `inspection_5_conflict.json` v2 (`scene_inspection_5_wide.jsonc`, pads 6 m apart; 2 pairs fly a shared line out and back, LLM vs scripted, ~13 s warning). After live run 1 (Drone2/Drone4 collided: 5-10 s free-tier decisions vs 8 s observation limit, a too-early return to layer, a 4.5 s-warning crossing): one model call per decision, safe-layer advice, stricter back-to-plan, contact episodes in the separation report | offline done; live rerun next |
+| next | Top-down track plot; mission-track CD&R metrics; Phase 1 tracks (gate, provenance, red team) | planned |
 | later | Trust assessor (scores + per-check results), action-risk gate with escalation, peer broadcasts, attack scenarios; `move_along_track`, `takeoff`, `land` | planned |
 
 ## Setup (Windows)
@@ -132,6 +133,7 @@ All commands from the repo root.
 | `python test_llm_pilot_live.py [--harness pydantic\|native] [--model SPEC] [--task "..."]` | yes | One drone (scene_basic_drone.jsonc) flown by an LLM pilot through its feed and port; takeoff/landing are setup/shutdown, not the agent's; prints every action, the agent's final comment and the run summary |
 | `python diag_path_follow.py [--speed 3] [--no-maneuvers]` | yes | One drone flies a 50 m rectangle with the velocity path follower; hold/resume, layer change and speed change mid-flight; reports cruise speed, cross-track, stopping distance, drift |
 | `python test_corridors_live.py [--mission missions/inspection_5.json] [--no-maneuvers]` | yes | Phase 0 base scenario: 5 drones fly crossing corridors (scene_inspection_5.jsonc), Remote ID between all of them, scripted mission agents send maneuvers through their ports (no attacks, no gate); PASS = all corridors done, all landed, separation >= 2 m with coverage |
+| `python test_corridors_live.py --mission missions/inspection_5_conflict.json --llm Drone2,Drone3` | yes | 2 LLM mission agents (model: `LLM_MODEL`) + 3 scripted drones that do not yield; two head-on encounters on shared layers; LLM agents wake on predicted conflicts and maneuver |
 | `python -m evaluation.summarize_run runs\run_<id>.jsonl` | no | Per-drone observation stream counts and chain observation (age) -> proposal -> gate decision -> result -> feedback code, shutdowns, separation; works on incomplete runs |
 | `python telemetry_explorer.py` | yes | Dumps every non-camera topic to `telemetry_dump.json` |
 
@@ -181,6 +183,8 @@ trust/assessor.py                   trust assessor interface + NoTrustAssessor p
 gate/action_gate.py                 action-risk gate interface + BypassGate placeholder
 agent/scripted_agent.py             ScriptedMissionAgent (fixed steps, no decision logic)
 agent/scripted_maneuvers.py         ScriptedManeuverAgent: corridor-flight stand-in for an LLM mission agent
+agent/mission_pilot.py              MissionPilot: LLM mission agent (watch loop + Pydantic AI episodes)
+conflict/detection.py               conflict detection (shared by agent tools, gate, evaluator)
 executor/path_follower.py           velocity path follower: continuous polyline flight, live maneuvers
 executor/mission_runner.py          MissionRunner: climb to layer, fly the corridor, apply maneuvers (port-facing)
 models/mission.py                   Corridor / DroneMission / MissionPlan (missions/*.json)

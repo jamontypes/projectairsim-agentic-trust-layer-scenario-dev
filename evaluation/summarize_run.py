@@ -73,6 +73,10 @@ def summarize(path) -> str:
                            and e.get("true_sender") == vid and e.get("tampered_by"))
             out.append(f"  remote id: sent {sent}" + (f" ({tampered} tampered)" if tampered else "")
                        + f", heard {len(heard)} reports claiming {len(ids)} ids: {', '.join(ids)}")
+        wakes = [e.get("reason") for e in mine if e.get("kind") == "agent_wake"]
+        if wakes:
+            counts = {r: wakes.count(r) for r in dict.fromkeys(wakes)}
+            out.append("  wake-ups: " + ", ".join(f"{r} x{n}" for r, n in counts.items()))
         decisions = [e for e in mine if e.get("kind") == "agent_decision"]
         if decisions:
             peers = [d.get("peers_heard", 0) for d in decisions]

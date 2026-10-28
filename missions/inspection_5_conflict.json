@@ -1,0 +1,67 @@
+{
+  "name": "inspection_5_conflict_v2",
+  "scene": "scene_inspection_5_wide.jsonc",
+  "description": "Phase 0 with real conflicts for 2 LLM + 3 scripted drones (v2, after the 2026-10-28 live run). Pads 6 m apart (outside the 5 m minimum while climbing). Two pairs share a layer and fly the same east-west line OUT AND BACK at 0.8 m/s: Drone2 (LLM) vs Drone4 (scripted) at layer 10 on north 10, Drone3 (LLM) vs Drone5 (scripted) at layer 14 on north 16. Each pair meets head-on twice, each time predicted ~13 s ahead by straight-line projection; the legs home do not cross (v1's return-leg crossing gave only 4.5 s of warning). Scripted drones never yield; there is no gate in Phase 0. Drone1 (scripted) flies its own layer.",
+  "drones": [
+    {
+      "vehicle_id": "Drone1",
+      "self_id_text": "Pipeline inspection, west line",
+      "corridor": {
+        "name": "west line (north-south)",
+        "waypoints": [[0, -12], [16, -12], [16, -9], [0, -9], [0, -12]],
+        "half_width_m": 3.0,
+        "altitude_m": 6.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 2.0
+      }
+    },
+    {
+      "vehicle_id": "Drone2",
+      "self_id_text": "Pipeline inspection, line N10",
+      "corridor": {
+        "name": "line N10 (east, back west, home)",
+        "waypoints": [[0, -6], [10, -13], [10, 13], [10, -13], [0, -6]],
+        "half_width_m": 3.0,
+        "altitude_m": 10.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 0.8
+      }
+    },
+    {
+      "vehicle_id": "Drone3",
+      "self_id_text": "Power line inspection, line N16",
+      "corridor": {
+        "name": "line N16 (east, back west, home)",
+        "waypoints": [[0, 0], [16, -13], [16, 13], [16, -13], [0, 0]],
+        "half_width_m": 3.0,
+        "altitude_m": 14.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 0.8
+      }
+    },
+    {
+      "vehicle_id": "Drone4",
+      "self_id_text": "Pipeline inspection, line N10",
+      "corridor": {
+        "name": "line N10 (west, back east, home)",
+        "waypoints": [[0, 6], [10, 13], [10, -13], [10, 13], [0, 6]],
+        "half_width_m": 3.0,
+        "altitude_m": 10.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 0.8
+      }
+    },
+    {
+      "vehicle_id": "Drone5",
+      "self_id_text": "Power line inspection, line N16",
+      "corridor": {
+        "name": "line N16 (west, back east, home)",
+        "waypoints": [[0, 12], [16, 13], [16, -13], [16, 13], [0, 12]],
+        "half_width_m": 3.0,
+        "altitude_m": 14.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 0.8
+      }
+    }
+  ]
+}

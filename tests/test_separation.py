@@ -227,3 +227,17 @@ def test_counted_sample_after_frozen_period_uses_new_timestamps():
     run(t, [(0.0, a), (0.05, a), (0.10, poses(**SAFE))])
     r = t.pairs[("Drone1", "Drone2")]
     assert r.samples == 2 and r.frozen == 1 and r.max_gap_s == pytest.approx(0.10)
+
+
+def test_a_long_contact_is_reported_as_one_episode_not_thousands_of_lines():
+    """Live 2026-10-28: a 3 s drone-drone contact produced ~1000 records per drone."""
+    t = SeparationTracker(["Drone1", "Drone2"])
+    t.update({"Drone1": (1, 0, 0, -5), "Drone2": (1, 10, 0, -5)})
+    hits = [CollisionState(has_collided=True, object_name="Drone2", sim_time_ns=int((117.84 + i * 0.01) * 1e9))
+            for i in range(300)]
+    later = CollisionState(has_collided=True, object_name="Drone2", sim_time_ns=int(130e9))
+    r = assess(t, {"Drone1": hits + [later], "Drone2": []}, ["Drone1", "Drone2"], 2.0)
+    assert len(r.vehicle_collisions) == 2
+    assert "contact until 120.83s, 300 records" in r.vehicle_collisions[0]
+    assert r.vehicle_collisions[1] == "Drone1 collided with Drone2 at 130.00s"
+    assert not r.passed and len(format_report(r).splitlines()) < 20

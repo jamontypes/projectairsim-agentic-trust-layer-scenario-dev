@@ -4,6 +4,12 @@ over Remote ID, and their (scripted) mission agents send maneuvers through the t
 layer's interfaces. No attacks, no defenses.
 
     python .\\test_corridors_live.py [--mission missions/inspection_5.json] [--no-maneuvers]
+    python .\\test_corridors_live.py --mission missions/inspection_5_conflict.json --llm Drone2,Drone3
+
+--llm  these drones get an LLM MissionPilot (Pydantic AI; model from --model / LLM_MODEL,
+       shared by all of them, so they share one request pace) instead of the scripted
+       agent. With LLM drones in the run, the scripted drones fly without maneuvers: they
+       are traffic that does not yield. The model is checked before anything connects.
 
 Per drone:
     ObservationFeed (5 Hz)  ->  ScriptedManeuverAgent  ->  ActionPort  ->  BypassGate  ->  MissionRunner
@@ -28,6 +34,7 @@ import time
 from dataclasses import asdict
 
 from adapters.projectairsim_adapter import ProjectAirSimAdapter
+from agent.mission_pilot import MissionPilot, MissionPilotConfig
 from agent.scripted_maneuvers import ScriptedManeuverAgent, Trigger
 from channel.action_port import ActionPort
 from channel.observation_feed import ObservationFeed
@@ -41,6 +48,7 @@ from gate.action_gate import BypassGate
 from models.action import ActionType, CommandStatus
 from models.mission import MissionPlan
 from models.telemetry import GroundState, ValidationStatus
+from observability import configure_observability
 from trust.assessor import NoTrustAssessor
 from utils.fleet import run_all_or_cancel
 from utils.flight_safety import safe_shutdown
@@ -49,6 +57,8 @@ from utils.separation import SeparationTracker, assess, format_report
 OBSERVATION_HZ = 5.0
 RID_HZ = 1.0
 MAX_OBSERVATION_AGE_S = 5.0        # the drone keeps moving now: decide on fresh observations
+LLM_MAX_OBSERVATION_AGE_S = 15.0   # LLM drones: free-tier Gemini decisions took 5-10 s (pacing + generation), live 2026-10-28
+LLM_STOP_GRACE_S = 30.0            # after the corridors: let a running episode finish
 AGENT_DECIDE_EVERY_S = 1.0
 TRUTH_HZ = 20
 MIN_SEPARATION_M, MIN_COVERAGE, MAX_GAP_S = 2.0, 0.9, 0.5
@@ -136,7 +146,24 @@ async def monitor(runners, receivers, stop, phase):
 async def main(args) -> int:
     plan = MissionPlan.load(args.mission)
     vehicles = plan.vehicle_ids
-    maneuvers = {} if args.no_maneuvers else MANEUVERS
+    llm = [v.strip() for v in args.llm.split(",") if v.strip()]
+    unknown = set(llm) - set(vehicles)
+    if unknown:
+        print(f"--llm names drones not in the mission: {sorted(unknown)}")
+        return 2
+    maneuvers = {} if (args.no_maneuvers or llm) else MANEUVERS
+    model = model_spec = None
+    traced = False
+    if llm:
+        from agent.model_config import pick_model
+        traced = configure_observability()
+        print("checking model availability...")
+        try:
+            model, model_spec, preflight = await pick_model(args.model)
+        except RuntimeError as err:
+            print(f"\nNOT FLYING: {err}")
+            return 2
+        print(f"LLM drones {llm} on {model_spec}" + ("  (Logfire tracing on)" if traced else ""))
     recorder = EvaluationRecorder(run_config={
         "script": "test_corridors_live.py", "mission_file": args.mission,
         "mission": plan.model_dump(mode="json"), "scene": plan.scene, "vehicles": vehicles,
@@ -148,9 +175,16 @@ async def main(args) -> int:
         "pipeline": {"observation_source": "projectairsim_ground_truth", "attack_hooks": [],
                      "remote_id": {"rate_hz": RID_HZ, "sender_hooks": {}, "link_hooks": []},
                      "trust_assessor": NoTrustAssessor.name, "action_gate": BypassGate.name,
-                     "agents": "ScriptedManeuverAgent", "observation_sample_hz": OBSERVATION_HZ,
+                     "agents": {v: ("MissionPilot" if v in llm else "ScriptedManeuverAgent")
+                                for v in vehicles},
+                     "llm_model": None if not llm else {"spec": model_spec, "preflight": preflight,
+                                                         "logfire": traced},
+                     "mission_pilot": asdict(MissionPilotConfig()) if llm else None,
+                     "observation_sample_hz": OBSERVATION_HZ,
                      "max_observation_age_s": MAX_OBSERVATION_AGE_S}})
     print(f"Recording to {recorder.path}")
+    if model is not None:
+        model.on_event = recorder.recorder_for(source="model")
     phase = {"name": "connect"}
     outcome, results, reports, separation = "aborted", {}, [], None
     agents, runners = {}, {}
@@ -176,11 +210,18 @@ async def main(args) -> int:
                                                         self_id_text=m.self_id_text)
                 runners[vid] = MissionRunner(adapter, m, executor, on_event=mission_events)
                 ports[vid] = ActionPort(vid, runners[vid], feeds[vid], gate=BypassGate(),
-                                        recorder=recorder, max_observation_age_s=MAX_OBSERVATION_AGE_S)
-                agents[vid] = ScriptedManeuverAgent(vid, feeds[vid], ports[vid], receivers[vid],
-                                                    m.corridor, maneuvers.get(vid, []),
-                                                    recorder=recorder,
-                                                    decide_every_s=AGENT_DECIDE_EVERY_S)
+                                        recorder=recorder,
+                                        max_observation_age_s=LLM_MAX_OBSERVATION_AGE_S
+                                        if vid in llm else MAX_OBSERVATION_AGE_S)
+                if vid in llm:
+                    agents[vid] = MissionPilot(vid, feeds[vid], ports[vid], receivers[vid], m, model,
+                                               recorder=recorder, model_label=model_spec,
+                                               on_step=lambda v, s: print(f"  [{time.strftime('%H:%M:%S')}] {v}: {s}"))
+                else:
+                    agents[vid] = ScriptedManeuverAgent(vid, feeds[vid], ports[vid], receivers[vid],
+                                                        m.corridor, maneuvers.get(vid, []),
+                                                        recorder=recorder,
+                                                        decide_every_s=AGENT_DECIDE_EVERY_S)
 
             stop, agents_stop = asyncio.Event(), asyncio.Event()
             tracker = SeparationTracker(vehicles)
@@ -209,6 +250,9 @@ async def main(args) -> int:
                     await run_all_or_cancel(fly(v) for v in vehicles)
                 finally:
                     agents_stop.set()
+                    done, pending = await asyncio.wait(agent_tasks, timeout=LLM_STOP_GRACE_S)
+                    for t in pending:                 # an episode still waiting on the model
+                        t.cancel()
                     await asyncio.gather(*agent_tasks, return_exceptions=True)
                 for vid in vehicles:            # what each agent heard at the end, for the record
                     recorder.record("traffic_view", vehicle_id=vid,
@@ -252,7 +296,13 @@ async def main(args) -> int:
                     f"max cross-track {r.max_cross_track_m:.2f} m" if r else f"{vid}: no result")
             print(line)
             a = agents.get(vid)
-            if a:
+            if isinstance(a, MissionPilot):
+                print(f"  LLM agent: {a.episodes} wake-ups, ended: {a.ended}")
+                for mv in a.maneuvers:
+                    print(f"    {mv['action_type']}: {mv['code']}")
+                for c in a.comments:
+                    print(f"    comment: {c}")
+            elif a:
                 print(f"  agent: {a.decisions} decisions, heard {len(receivers[vid].latest())} peers")
                 for t, fb in a.feedback:
                     mark = "OK  " if fb.status == CommandStatus.SUCCEEDED else "----"
@@ -285,4 +335,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--mission", default="missions/inspection_5.json")
     ap.add_argument("--no-maneuvers", action="store_true")
+    ap.add_argument("--llm", default="", help="comma list of drones flown by LLM agents")
+    ap.add_argument("--model", default=None, help="Pydantic AI model spec (else LLM_MODEL)")
     sys.exit(asyncio.run(main(ap.parse_args())))

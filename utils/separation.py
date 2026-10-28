@@ -139,6 +139,31 @@ class SeparationReport:
         return self.status == "pass"
 
 
+CONTACT_GAP_S = 0.5
+
+
+def _t(ns) -> str:
+    return f"{ns / 1e9:.2f}s" if ns else "?"
+
+
+def _episodes(events):
+    """Group contact records into episodes per object: [(object, first_ns, last_ns, n,
+    max impact speed)], in time order. Records without a timestamp are their own episode."""
+    out, open_ = [], {}
+    for c in sorted(events, key=lambda c: c.sim_time_ns or 0):
+        t, obj, v = c.sim_time_ns, c.object_name, c.impact_speed_mps
+        ep = open_.get(obj)
+        if ep is not None and t and ep[2] and (t - ep[2]) / 1e9 < CONTACT_GAP_S:
+            ep[2], ep[3] = t, ep[3] + 1
+            if v is not None:
+                ep[4] = v if ep[4] is None else max(ep[4], v)
+            continue
+        ep = [obj, t, t, 1, v]
+        open_[obj] = ep
+        out.append(ep)
+    return [tuple(e) for e in out]
+
+
 def _is_vehicle(object_name: str | None, vehicle_ids) -> bool:
     if not object_name:
         return False
@@ -155,15 +180,22 @@ def assess(tracker: SeparationTracker, collisions: dict, vehicle_ids,
     without a counted sample (including the start and, if finish() was called,
     the end of the run).
     """
+    # The simulator reports a contact on every physics step it lasts (a 3 s contact
+    # was ~1000 records per drone, live 2026-10-28), so contacts are grouped into
+    # episodes: same drone and object, records less than CONTACT_GAP_S apart.
     vehicle_hits, impacts = [], []
     for vid, events in collisions.items():
-        for c in events:
-            t = f"{c.sim_time_ns / 1e9:.2f}s" if c.sim_time_ns else "?"
-            if _is_vehicle(c.object_name, [v for v in vehicle_ids if v != vid]):
-                vehicle_hits.append(f"{vid} collided with {c.object_name} at {t}")
-            elif c.is_resting_contact is False:
-                speed = f"{c.impact_speed_mps:.1f} m/s" if c.impact_speed_mps is not None else "?"
-                impacts.append(f"{vid} impact with {c.object_name} at {t} (~{speed})")
+        others = [v for v in vehicle_ids if v != vid]
+        hit_eps = _episodes([c for c in events if _is_vehicle(c.object_name, others)])
+        imp_eps = _episodes([c for c in events if not _is_vehicle(c.object_name, others)
+                             and c.is_resting_contact is False])
+        for obj, t0, t1, n, _ in hit_eps:
+            vehicle_hits.append(f"{vid} collided with {obj} at {_t(t0)}"
+                                + (f" (contact until {_t(t1)}, {n} records)" if n > 1 else ""))
+        for obj, t0, t1, n, vmax in imp_eps:
+            speed = f"{vmax:.1f} m/s" if vmax is not None else "?"
+            impacts.append(f"{vid} impact with {obj} at {_t(t0)} (~{speed})"
+                           + (f" (until {_t(t1)}, {n} records)" if n > 1 else ""))
     unsampled = [p for p, r in tracker.pairs.items() if not r.samples]
     coverage = [f"never sampled: {a}-{b}" for a, b in unsampled]
     for (a, b), r in tracker.pairs.items():

@@ -68,7 +68,7 @@ class FollowerConfig:
     hold_latch_speed_mps: float = 0.3   # pin the hold point once braked below this...
     hold_brake_max_s: float = 3.0       # ...or after this long braking (sim time), whichever first
     vertical_gain: float = 0.8
-    max_vertical_mps: float = 1.0
+    max_vertical_mps: float = 1.5     # layer changes: 3 m in ~2.5 s (Simple Flight climbs 2 m/s fine)
     deadband_m: float = 0.15
     done_tolerance_m: float = 0.5       # horizontal, to the final point
     done_altitude_tolerance_m: float = 0.5
