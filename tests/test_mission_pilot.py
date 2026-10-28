@@ -323,3 +323,24 @@ def test_layer_changes_are_checked_on_the_way_not_only_at_the_layer():
     layers = p.safe_layers(sit)
     assert all(a < 13.9 for a in layers), layers         # nothing that climbs through Drone3
     assert p.what_if_altitude(sit, 9.9) == []            # staying put is not a transition
+
+
+def test_wakes_when_a_safe_layer_opens_and_rechecks_sooner_as_the_conflict_nears():
+    """Live 2026-10-28 (run d0488f): head-on with Drone4, no safe layer at the first wake-up
+    (Drone3 crossing above), the model slowed down and the 8 s recheck came too late."""
+    from conflict.detection import Track
+    p = make_pilot()                                    # recheck 8 s, gap 2 s
+    own = Track("Drone2", 10, -10, 10, 0, 0.8, 0)
+    d4 = Track("Drone4", 10, 10, 10, 0, -0.8, 0)        # head-on, ~10 s to loss of separation
+    blocker = Track("Drone3", 10, -9, 14, 0, 0.8, 0)    # right above-ish: every climb crosses it
+    sit = lambda now, peers, t_los: {"own": own, "peers": peers, "now": now,   # noqa: E731
+                                     "conflicts": [P("Drone4", t_los)]}
+    low = Track("Drone1", 8, -12, 6, 0, 0, 0)            # hovering below: 5-8 keep no margin
+    assert p.safe_layers(sit(0, [d4, blocker, low], 10)) == []
+    p._handled, p._last_episode_end, p._no_safe_layer = {"Drone4"}, 0.0, True
+    assert p._wake_reason(sit(2.5, [d4, blocker, low], 10.0)) is None        # still no layer
+    assert p._wake_reason(sit(3.0, [d4], 9.5)) == "safe_layer_available"
+    p._no_safe_layer = False
+    assert p._wake_reason(sit(3.0, [d4], 12.0)) is None                 # recheck at 6 s
+    assert p._wake_reason(sit(3.0, [d4], 5.0)) == "conflict_persists"   # closer: 2.5 s
+    assert p._wake_reason(sit(3.0, [d4], 20.0)) is None                 # far: full 8 s
