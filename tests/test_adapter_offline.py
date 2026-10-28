@@ -6,6 +6,7 @@ robustness and validation can be checked anywhere.
     python -m pytest tests                      (from the repo root)
     python -m tests.test_adapter_offline        (no pytest needed)
 """
+from collections import deque
 import math
 import sys
 import threading
@@ -504,6 +505,22 @@ def test_reconnect_clears_collision_log():
     publish_collision(a, {"time_stamp": T0, "object_name": "Ground", "normal": UP})
     a.connect()
     assert a.collision_log("Drone1") == []
+
+
+def test_collision_log_keeps_the_first_contact_through_a_long_one(monkeypatch):
+    """Live 2026-10-28: a lasting contact is reported every physics step; a rolling window
+    lost the first contact and the report put a 31 s collision at 183 s."""
+    import adapters.projectairsim_adapter as mod
+    monkeypatch.setattr(mod, "COLLISION_HEAD", 3)
+    a = make_adapter()
+    fresh_pose(a)
+    a._cache["Drone1"].collision_log = deque(maxlen=4)
+    for i in range(20):
+        publish_collision(a, {"time_stamp": T0 + i * 1_000_000, "object_name": f"Drone2#{i}"})
+    names = [c.object_name for c in a.collision_log("Drone1")]
+    assert names == ["Drone2#0", "Drone2#1", "Drone2#2", "Drone2#16", "Drone2#17",
+                     "Drone2#18", "Drone2#19"]
+    assert a.collision_log_dropped("Drone1") == 13
 
 
 if __name__ == "__main__":

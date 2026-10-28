@@ -102,6 +102,9 @@ def parse_pose_message(msg) -> tuple[int, float, float, float]:
     return int(ts), x, y, z
 
 
+COLLISION_HEAD = 2000          # first collision records always kept (see _VehicleCache)
+
+
 @dataclass
 class _VehicleCache:
     pose_ts: int | None = None
@@ -117,8 +120,13 @@ class _VehicleCache:
     # Ground detector (updated on the pose thread so it runs at ~330 Hz, not at snapshot rate)
     contact_latch: tuple[float, float, float] | None = None  # NED xyz at the last supporting contact
     still_since_ts: int | None = None           # sim ts when the vehicle became still
-    # Every collision this session (CollisionState only keeps the latest one).
+    # Collisions this session (CollisionState only keeps the latest one): the first
+    # COLLISION_HEAD records and the latest 1000. A contact that lasts is reported every
+    # physics step, so a rolling window alone loses the first contact (live 2026-10-28:
+    # a 31 s collision was reported at 183 s after 50k resting-contact records).
+    collision_head: list = field(default_factory=list)
     collision_log: deque = field(default_factory=lambda: deque(maxlen=1000))
+    collision_dropped: int = 0
 
 
 # ---------------------------------------------------------------- adapter
@@ -263,7 +271,9 @@ class ProjectAirSimAdapter:
                         c.contact_latch = None
                         c.still_since_ts = None
                         c.collision = CollisionState()
+                        c.collision_head.clear()
                         c.collision_log.clear()
+                        c.collision_dropped = 0
                         self._record_bad_msg(
                             c, f"actual_pose: time_stamp went backwards ({c.pose_ts} -> {ts})")
                     if c.pose_ts is None or ts != c.pose_ts:
@@ -339,7 +349,13 @@ class ProjectAirSimAdapter:
                         count=old.count + 1,
                         impact_count=old.impact_count + (1 if resting is False else 0),
                     )
-                    c.collision_log.append(c.collision.model_copy())
+                    rec = c.collision.model_copy()
+                    if len(c.collision_head) < COLLISION_HEAD:
+                        c.collision_head.append(rec)
+                    else:
+                        if len(c.collision_log) == c.collision_log.maxlen:
+                            c.collision_dropped += 1
+                        c.collision_log.append(rec)
                     # Only a slow touch on an upward-facing surface can support the vehicle.
                     # A wall (normal ~horizontal) or missing normal never latches.
                     if resting is True and c.collision.is_supporting_surface and c.pose_window:
@@ -492,9 +508,15 @@ class ProjectAirSimAdapter:
             return {v: c.pose_window[-1] for v, c in self._cache.items() if c.pose_window}
 
     def collision_log(self, vehicle_id: str) -> list[CollisionState]:
-        """Every collision reported for this vehicle this session, oldest first."""
+        """Collisions reported for this vehicle this session, oldest first: the first
+        COLLISION_HEAD and the latest 1000 (collision_log_dropped() counts the middle)."""
         with self._lock:
-            return list(self._cache[vehicle_id].collision_log)
+            c = self._cache[vehicle_id]
+            return c.collision_head + list(c.collision_log)
+
+    def collision_log_dropped(self, vehicle_id: str) -> int:
+        with self._lock:
+            return self._cache[vehicle_id].collision_dropped
 
     def topic_stats(self) -> dict:
         with self._lock:

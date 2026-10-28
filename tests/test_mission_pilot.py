@@ -305,3 +305,21 @@ def test_live_broadcasts_carry_the_runner_target_layer():
         targets.setdefault(m["uas_id"], set()).add(m.get("target_altitude_m"))
     for vid in PLAN.vehicle_ids:
         assert PLAN.for_vehicle(vid).corridor.altitude_m in targets.get(vid, set()), vid
+
+
+def test_layer_changes_are_checked_on_the_way_not_only_at_the_layer():
+    """Live 2026-10-28 (run d7c936), the moment Drone2 chose 17: Drone3 was crossing its line
+    4 m above (at 14) and 5 m away. 17 kept the margin from everyone and was conflict-free
+    once there, so it was offered; the climb went straight through Drone3."""
+    from conflict.detection import Track, detect
+    p = make_pilot()                                    # Drone2: band 5-20, layer 10
+    own = Track("Drone2", 10.1, -11.2, 9.9, 0.0, 0.8, 0.0)
+    trk = math.radians(320.9)                           # Drone3's transit leg, toward (16,-13)
+    d3 = Track("Drone3", 8.1, -6.6, 13.9, 0.8 * math.cos(trk), 0.8 * math.sin(trk), 0.0)
+    sit = {"own": own, "peers": [d3]}
+    level_only = Track("Drone2", 10.1, -11.2, 17.0, 0.0, 0.8, 0.0)
+    assert detect(level_only, [d3], p.config.minima, 30) == []        # what the old check saw
+    assert [h.other_id for h in p.what_if_altitude(sit, 17.0)] == ["Drone3"]
+    layers = p.safe_layers(sit)
+    assert all(a < 13.9 for a in layers), layers         # nothing that climbs through Drone3
+    assert p.what_if_altitude(sit, 9.9) == []            # staying put is not a transition

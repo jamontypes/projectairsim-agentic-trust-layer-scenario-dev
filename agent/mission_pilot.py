@@ -73,6 +73,7 @@ class MissionPilotConfig:
     min_episode_gap_s: float = 2.0
     start_within_m: float = 1.0        # start watching once within this of the assigned layer
     layer_margin_m: float = 1.0        # escape layers: vertical minimum + this margin
+    vertical_rate_mps: float = 1.5     # layer changes are checked at this rate and at half of it
     nearby_m: float = 25.0             # safe layers keep the margin from drones this close
     back_to_plan_clear_m: float = 15.0 # ...and going back needs no drone this close near the layer
     safe_layers_max: int = 5
@@ -107,7 +108,8 @@ Rules:
 1. Act only on a predicted conflict or to return to your plan; otherwise maintain.
 2. Prefer, in order: change to another layer, choosing from safe_layers_m when it is given
    (computed from the reports: at least {cfg.minima.vertical_m + cfg.layer_margin_m:g} m from
-   every nearby drone and conflict-free by projection, closest first); then a speed change;
+   every nearby drone and conflict-free by projection, both at the layer and on the climb or
+   descent to it; closest first; empty means no layer change is safe now); then a speed change;
    then a timed hold. Give absolute targets ("altitude_m 13"), never relative ones.
 3. Do not create a new conflict: check the other drones' altitudes and tracks first. A drone
    that reports target_altitude_m is moving to that layer: treat it as occupying both its
@@ -179,12 +181,31 @@ class MissionPilot:
                 "own": own, "peers": peers}
 
     def what_if_altitude(self, sit, altitude_m: float) -> list:
-        """Conflicts if own-ship were at altitude_m now (same horizontal motion, level):
-        the same projection the gate will use to check 'no new conflict'."""
-        o = sit["own"]
+        """Conflicts if own-ship changed to altitude_m now: level at the new altitude (same
+        horizontal motion), and on the way there. The same projection the gate will use to
+        check 'no new conflict'."""
+        o, cfg = sit["own"], self.config
         hypo = Track(o.id, o.north_m, o.east_m, altitude_m, o.v_north_mps, o.v_east_mps, 0.0)
-        return _soonest_per_peer(detect(hypo, sit["peers"], self.config.minima,
-                                        self.config.lookahead_s))
+        found = detect(hypo, sit["peers"], cfg.minima, cfg.lookahead_s)
+        return _soonest_per_peer(sorted(found + self._transition_conflicts(sit, altitude_m),
+                                        key=lambda p: p.t_los_s))
+
+    def _transition_conflicts(self, sit, altitude_m: float) -> list:
+        """Conflicts during the climb or descent itself (live 2026-10-28: Drone2 climbed from
+        10 to 17, a layer clear of everyone, straight through Drone3 crossing above at 14).
+        Checked at the nominal vertical rate and at half of it, since the real rate varies."""
+        o, cfg = sit["own"], self.config
+        delta = altitude_m - o.altitude_m
+        out = []
+        for rate in (cfg.vertical_rate_mps, cfg.vertical_rate_mps / 2):
+            t_change = abs(delta) / rate
+            if t_change < 0.2:
+                continue
+            moving = Track(o.id, o.north_m, o.east_m, o.altitude_m, o.v_north_mps, o.v_east_mps,
+                           math.copysign(rate, delta))
+            out += [p for p in detect(moving, sit["peers"], cfg.minima, t_change)
+                    if p.t_los_s <= t_change]
+        return out
 
     def _nearby_peers(self, sit, radius_m: float):
         o = sit["own"]
