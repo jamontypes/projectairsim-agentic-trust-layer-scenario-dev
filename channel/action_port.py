@@ -58,6 +58,17 @@ _EXECUTOR_FEEDBACK = {
                                          "vehicle is not ready; nothing was sent."),
     "task_timeout": ("timed_out", "The command did not complete in time."),
     "settle_timeout": ("timed_out", "The command did not complete in time."),
+    # mission runner (executor/mission_runner.py): maneuvers are applied, not completed
+    "applied": ("applied", "Maneuver applied: the drone is carrying it out while continuing "
+                           "its mission."),
+    "not_applicable": ("not_applicable", "That maneuver does not apply right now (for example "
+                                         "resume while not holding); nothing changed."),
+    "out_of_range": ("out_of_range", "The flight controller cannot fly that value; nothing "
+                                     "changed."),
+    "not_flying": ("not_flying", "The drone is not flying its corridor right now; nothing "
+                                 "changed."),
+    "mission_finished": ("mission_finished", "Your corridor is complete; no more maneuvers are "
+                                             "accepted."),
 }
 _FAILED = ("failed", "The command failed in the flight controller.")
 

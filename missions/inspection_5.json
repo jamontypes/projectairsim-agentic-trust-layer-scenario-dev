@@ -1,0 +1,67 @@
+{
+  "name": "inspection_5_layered",
+  "scene": "scene_inspection_5.jsonc",
+  "description": "Phase 0 baseline. Five inspection corridors that cross (2 north-south, 2 east-west, 1 diagonal), each a loop from and back to the drone's launch pad. Every drone has its own altitude layer, 3 m apart (ground is about 2.7 m in this frame), so all crossings are vertically separated by the plan itself: a scripted-coordination baseline, not conflict resolution. Pads are 3 m apart along east at north 0. The flown area (north 0-18 m, east -13..13 m) stays within what earlier Blocks runs flew without obstacles.",
+  "drones": [
+    {
+      "vehicle_id": "Drone1",
+      "self_id_text": "Pipeline inspection, west line",
+      "corridor": {
+        "name": "west line (north-south)",
+        "waypoints": [[0, -6], [18, -6], [18, -9], [0, -9], [0, -6]],
+        "half_width_m": 3.0,
+        "altitude_m": 6.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 3.0
+      }
+    },
+    {
+      "vehicle_id": "Drone2",
+      "self_id_text": "Pipeline inspection, south cross line",
+      "corridor": {
+        "name": "south cross line (east-west, north 7)",
+        "waypoints": [[0, -3], [7, -3], [7, -13], [7, 13], [7, -3], [0, -3]],
+        "half_width_m": 3.0,
+        "altitude_m": 9.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 3.0
+      }
+    },
+    {
+      "vehicle_id": "Drone3",
+      "self_id_text": "Power line inspection, diagonal",
+      "corridor": {
+        "name": "diagonal power line",
+        "waypoints": [[0, 0], [18, 12], [18, -12], [0, 0]],
+        "half_width_m": 3.0,
+        "altitude_m": 12.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 3.0
+      }
+    },
+    {
+      "vehicle_id": "Drone4",
+      "self_id_text": "Pipeline inspection, north cross line",
+      "corridor": {
+        "name": "north cross line (east-west, north 14)",
+        "waypoints": [[0, 3], [14, 3], [14, 13], [14, -13], [14, 3], [0, 3]],
+        "half_width_m": 3.0,
+        "altitude_m": 15.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 3.0
+      }
+    },
+    {
+      "vehicle_id": "Drone5",
+      "self_id_text": "Pipeline inspection, east line",
+      "corridor": {
+        "name": "east line (north-south)",
+        "waypoints": [[0, 6], [18, 6], [18, 9], [0, 9], [0, 6]],
+        "half_width_m": 3.0,
+        "altitude_m": 18.0,
+        "altitude_band_m": [5.0, 20.0],
+        "cruise_speed_mps": 3.0
+      }
+    }
+  ]
+}

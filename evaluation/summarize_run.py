@@ -65,6 +65,19 @@ def summarize(path) -> str:
         rate = [e.get("rate_hz") for e in mine if e.get("kind") == "sampling"]
         out.append(f"  observations: {n_obs} delivered ({n_tamp} tampered), {n_drop} dropped, "
                    f"{n_err} errors" + (f"; sampled at {rate[0]:g} Hz" if rate else "; on demand"))
+        heard = [e["report"] for e in mine if e.get("kind") == "rid_report"]
+        if heard:
+            ids = sorted({r.get("claimed_uas_id") for r in heard})
+            sent = sum(1 for e in ev if e.get("kind") == "rid_transmit" and e.get("true_sender") == vid)
+            tampered = sum(1 for e in ev if e.get("kind") == "rid_transmit"
+                           and e.get("true_sender") == vid and e.get("tampered_by"))
+            out.append(f"  remote id: sent {sent}" + (f" ({tampered} tampered)" if tampered else "")
+                       + f", heard {len(heard)} reports claiming {len(ids)} ids: {', '.join(ids)}")
+        decisions = [e for e in mine if e.get("kind") == "agent_decision"]
+        if decisions:
+            peers = [d.get("peers_heard", 0) for d in decisions]
+            out.append(f"  agent decisions: {len(decisions)}, peers in its traffic view "
+                       f"{min(peers)}-{max(peers)}")
         for c in chains:
             e = c["proposal"]
             if e.get("vehicle_id") != vid:

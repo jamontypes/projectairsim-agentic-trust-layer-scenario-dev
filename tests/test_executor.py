@@ -104,10 +104,14 @@ class FakeDrone:
         self.velocities = getattr(self, "velocities", []) + [(v_north, v_east, v_down)]
         w = self.world
 
-        def apply():
-            w.target_ne = (w.n + v_north * duration, w.e + v_east * duration)
-            w.target_alt = w.alt - v_down * duration
-        return await self._command("move_by_velocity", apply)
+        # applied at once (a velocity command takes effect immediately; polling loops that
+        # send one per tick would otherwise outrun the fake's 20 ms command delay)
+        self.calls.append("move_by_velocity")
+        w.target_ne = (w.n + v_north * duration, w.e + v_east * duration)
+        w.target_alt = w.alt - v_down * duration
+        done = asyncio.get_running_loop().create_future()
+        done.set_result(None)
+        return done
 
 
 class FakeAdapter:

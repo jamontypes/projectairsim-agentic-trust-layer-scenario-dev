@@ -13,6 +13,10 @@ def act(action_type, **params):
 
 @pytest.mark.parametrize("action_type,params", [
     (ActionType.HOLD, {"duration_s": 3}),
+    (ActionType.HOLD, {}),
+    (ActionType.MAINTAIN, {}),
+    (ActionType.RESUME, {}),
+    (ActionType.CHANGE_SPEED, {"speed_mps": 2.0}),
     (ActionType.TAKEOFF, {}),
     (ActionType.ROTATE_TO_HEADING, {"heading_deg": 90}),
     (ActionType.CHANGE_ALTITUDE, {"altitude_m": 10}),
@@ -38,6 +42,10 @@ def test_valid_actions(action_type, params):
     (ActionType.MOVE_ALONG_TRACK, {"track_deg": -10, "speed_mps": 3, "duration_s": 5}, "[0, 360)"),
     (ActionType.MOVE_ALONG_TRACK, {"track_deg": 0, "speed_mps": 0, "duration_s": 5}, "> 0"),
     (ActionType.HOLD, {"duration_s": -1}, "> 0"),
+    (ActionType.CHANGE_SPEED, {}, "missing"),
+    (ActionType.CHANGE_SPEED, {"speed_mps": 0.0}, "> 0"),
+    (ActionType.MAINTAIN, {"speed_mps": 2.0}, "not allowed"),
+    (ActionType.RESUME, {"duration_s": 2.0}, "not allowed"),
     (ActionType.CHANGE_ALTITUDE, {"altitude_m": math.nan}, "finite"),
     (ActionType.CHANGE_ALTITUDE, {"altitude_m": math.inf}, "finite"),
 ])

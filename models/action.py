@@ -23,28 +23,39 @@ from models.telemetry import TelemetrySnapshot
 
 
 class ActionType(str, Enum):
-    HOLD = "hold"                              # hover in place for duration_s
+    # Flight-controller commands (executor/projectairsim_executor.py): each runs to completion.
+    HOLD = "hold"                              # stop and stay; optional duration_s
     TAKEOFF = "takeoff"
     ROTATE_TO_HEADING = "rotate_to_heading"    # turn the nose; position held
     CHANGE_ALTITUDE = "change_altitude"        # climb/descend; N/E held
     MOVE_ALONG_TRACK = "move_along_track"      # move in a direction for a time; heading unchanged
     MOVE_TO_POSITION = "move_to_position"      # go to N/E/altitude and stop
     LAND = "land"
+    # Mission-layer maneuvers (executor/mission_runner.py): change how the drone flies its
+    # corridor; applied at once, the drone carries them out while the mission continues.
+    #   HOLD and CHANGE_ALTITUDE (a layer change) above are maneuvers there too.
+    MAINTAIN = "maintain"                      # no change: a recorded decision to carry on
+    RESUME = "resume"                          # continue the corridor after a hold
+    CHANGE_SPEED = "change_speed"              # new cruise speed along the corridor
 
 
 PARAMS = ("heading_deg", "track_deg", "speed_mps", "altitude_m",
           "north_m", "east_m", "duration_s")
 
 REQUIRED: dict[ActionType, set[str]] = {
-    ActionType.HOLD: {"duration_s"},
+    ActionType.HOLD: set(),
     ActionType.TAKEOFF: set(),
     ActionType.ROTATE_TO_HEADING: {"heading_deg"},
     ActionType.CHANGE_ALTITUDE: {"altitude_m"},
     ActionType.MOVE_ALONG_TRACK: {"track_deg", "speed_mps", "duration_s"},
     ActionType.MOVE_TO_POSITION: {"north_m", "east_m", "altitude_m"},
     ActionType.LAND: set(),
+    ActionType.MAINTAIN: set(),
+    ActionType.RESUME: set(),
+    ActionType.CHANGE_SPEED: {"speed_mps"},
 }
 OPTIONAL: dict[ActionType, set[str]] = {
+    ActionType.HOLD: {"duration_s"},               # without it: hold until resume
     ActionType.CHANGE_ALTITUDE: {"speed_mps"},     # vertical speed
     ActionType.MOVE_TO_POSITION: {"speed_mps"},    # cruise speed
 }
