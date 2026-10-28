@@ -1,0 +1,82 @@
+{
+  "id": "SceneFiveDrones",
+
+  // Five quadrotors for the 100 x 100 m search area centered on the scene
+  // origin (north and east both run from -50 to 50). xyz is "north east down"
+  // in meters (up is negative z).
+  // Each drone spawns inside its own 20 m wide sector, 2 m in from the south
+  // edge (north = -48): sector centers are east = -40, -20, 0, 20, 40.
+  "actors": [
+    {
+      "type": "robot",
+      "name": "Drone1",
+      "origin": {
+        "xyz": "-48.0 -40.0 -1.0",
+        "rpy-deg": "0 0 0"
+      },
+      "robot-config": "robot_quadrotor_fastphysics.jsonc",
+      "start-landed": true
+    },
+    {
+      "type": "robot",
+      "name": "Drone2",
+      "origin": {
+        "xyz": "-48.0 -20.0 -1.0",
+        "rpy-deg": "0 0 0"
+      },
+      "robot-config": "robot_quadrotor_fastphysics.jsonc",
+      "start-landed": true
+    },
+    {
+      "type": "robot",
+      "name": "Drone3",
+      "origin": {
+        "xyz": "-48.0 0.0 -1.0",
+        "rpy-deg": "0 0 0"
+      },
+      "robot-config": "robot_quadrotor_fastphysics.jsonc",
+      "start-landed": true
+    },
+    {
+      "type": "robot",
+      "name": "Drone4",
+      "origin": {
+        "xyz": "-48.0 20.0 -1.0",
+        "rpy-deg": "0 0 0"
+      },
+      "robot-config": "robot_quadrotor_fastphysics.jsonc",
+      "start-landed": true
+    },
+    {
+      "type": "robot",
+      "name": "Drone5",
+      "origin": {
+        "xyz": "-48.0 40.0 -1.0",
+        "rpy-deg": "0 0 0"
+      },
+      "robot-config": "robot_quadrotor_fastphysics.jsonc",
+      "start-landed": true
+    }
+  ],
+
+  "clock": {
+    "type": "steppable",
+    "step-ns": 3000000,
+    "real-time-update-rate": 3000000,
+    "pause-on-start": false
+  },
+
+  "home-geo-point": {
+    "latitude": 47.641468,
+    "longitude": -122.140165,
+    "altitude": 122.0
+  },
+
+  "segmentation": {
+    "initialize-ids": true,
+    "ignore-existing": false,
+    "use-owner-name": true
+  },
+
+  "scene-type": "UnrealNative"
+}
