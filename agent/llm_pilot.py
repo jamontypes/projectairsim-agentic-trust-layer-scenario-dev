@@ -350,7 +350,8 @@ class LLMPilot(PilotCore):
             self._on_step(self.vehicle_id, "thinking")
             t0 = self._clock()
             try:
-                turn = await asyncio.wait_for(call(), min(lim.model_timeout_s, remaining))
+                async with asyncio.timeout(min(lim.model_timeout_s, remaining)):  # not wait_for
+                    turn = await call()
             except asyncio.CancelledError:
                 raise
             except Exception as err:

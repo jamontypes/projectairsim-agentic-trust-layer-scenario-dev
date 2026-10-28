@@ -367,7 +367,11 @@ class ProjectAirSimExecutor:
     async def _send(self, cmd, drone, action, *args):
         cfg = self.config
         try:
-            return await asyncio.wait_for(cmd(drone, action, *args), cfg.invoke_timeout_s)
+            # asyncio.timeout, not wait_for: on Python 3.11 wait_for can swallow a
+            # cancellation that arrives as the call completes; the command would then run
+            # on instead of hovering and re-raising.
+            async with asyncio.timeout(cfg.invoke_timeout_s):
+                return await cmd(drone, action, *args)
         except asyncio.TimeoutError:
             raise _Abort(CommandStatus.TIMED_OUT,
                          f"simulator did not accept the command within {cfg.invoke_timeout_s:.1f} s",
@@ -505,8 +509,10 @@ class ProjectAirSimExecutor:
     async def _hover(self, drone) -> str:
         t = self.config.hover_timeout_s
         try:
-            task = await asyncio.wait_for(drone.hover_async(), t)
-            await asyncio.wait_for(task, t)
+            async with asyncio.timeout(t):
+                task = await drone.hover_async()
+            async with asyncio.timeout(t):
+                await task
             return "hover"
         except Exception as err:
             self._log(f"[executor] hover fallback failed: {type(err).__name__}: {err}")

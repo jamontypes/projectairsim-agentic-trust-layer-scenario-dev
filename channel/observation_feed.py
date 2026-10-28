@@ -125,7 +125,8 @@ class ObservationFeed:
             new = self._new()
             new.clear()
             try:
-                await asyncio.wait_for(new.wait(), remaining)
+                async with asyncio.timeout(remaining):     # not wait_for: see executor._send
+                    await new.wait()
             except asyncio.TimeoutError:
                 return None
 
@@ -148,7 +149,8 @@ class ObservationFeed:
                     await asyncio.sleep(delay)
                 else:
                     try:
-                        await asyncio.wait_for(stop.wait(), delay)
+                        async with asyncio.timeout(delay):  # not wait_for: see executor._send
+                            await stop.wait()
                     except asyncio.TimeoutError:
                         pass
         finally:

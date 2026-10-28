@@ -228,9 +228,12 @@ def test_permanent_model_error_is_not_retried_and_ends_cleanly():
 
 
 def test_rate_limit_waits_are_recorded():
-    pilot, rec, _, _ = build(Planned([TURN]), rpm=6000)
-    run(pilot)
-    assert rec.of("llm_rate_wait")                   # every request after the first waited
+    # 60/min = 1 s apart; build() gives the limiter an instant sleep, so this is deterministic
+    # (6000/min flaked: on a slow run the calls were naturally > 10 ms apart)
+    pilot, rec, _, _ = build(Planned([TURN]), rpm=60)
+    out = run(pilot)
+    waits = rec.of("llm_rate_wait")
+    assert len(waits) == out.model_turns - 1 and all(w["waited_s"] > 0.5 for w in waits)
 
 
 def test_cancellation_propagates_and_is_recorded():
