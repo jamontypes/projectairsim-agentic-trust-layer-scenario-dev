@@ -239,3 +239,26 @@ def test_bad_rate_rejected():
     _, _, _, _, _, tx = fleet()
     with pytest.raises(ValueError):
         asyncio.run(tx["Drone1"].run(rate_hz=0))
+
+
+def test_target_altitude_intent_is_broadcast_only_when_given():
+    snap = snapshot("Drone2", n=3.0, e=4.0, alt=8.0)
+    assert "target_altitude_m" not in message_from_snapshot("Drone2", snap)
+    assert message_from_snapshot("Drone2", snap, "", 17.0)["target_altitude_m"] == 17.0
+
+
+def test_broadcaster_intent_reaches_the_traffic_view_and_a_failing_intent_is_omitted():
+    adapter, rec = SnapAdapter(("Drone1", "Drone2")), ListRecorder()
+    bus = RemoteIdBus(recorder=rec)
+    rx = bus.attach(RemoteIdReceiver("Drone1", recorder=rec))
+    target = {"v": 17.0}
+    tx = RemoteIdBroadcaster(adapter, "Drone2", bus, recorder=rec, intent=lambda: target["v"])
+    tx.broadcast_once()
+    peer = traffic_for_model(rx, now_host_s=rx.latest()["Drone2"].received_host_s)["peers"][0]
+    assert peer["target_altitude_m"] == 17.0
+
+    def broken():
+        raise RuntimeError("no follower")
+    RemoteIdBroadcaster(adapter, "Drone2", bus, recorder=rec, intent=broken).broadcast_once()
+    peer = traffic_for_model(rx, now_host_s=rx.latest()["Drone2"].received_host_s)["peers"][0]
+    assert peer["target_altitude_m"] is None

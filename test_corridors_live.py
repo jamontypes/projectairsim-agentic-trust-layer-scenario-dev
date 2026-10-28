@@ -206,9 +206,10 @@ async def main(args) -> int:
                 feeds[vid] = ObservationFeed(adapter, vid, assessor=NoTrustAssessor(), recorder=recorder)
                 receivers[vid] = bus.attach(RemoteIdReceiver(vid, assessor=NoTrustAssessor(),
                                                              recorder=recorder))
-                broadcasters[vid] = RemoteIdBroadcaster(adapter, vid, bus, recorder=recorder,
-                                                        self_id_text=m.self_id_text)
                 runners[vid] = MissionRunner(adapter, m, executor, on_event=mission_events)
+                broadcasters[vid] = RemoteIdBroadcaster(adapter, vid, bus, recorder=recorder,
+                                                        self_id_text=m.self_id_text,
+                                                        intent=runners[vid].target_altitude_m)
                 ports[vid] = ActionPort(vid, runners[vid], feeds[vid], gate=BypassGate(),
                                         recorder=recorder,
                                         max_observation_age_s=LLM_MAX_OBSERVATION_AGE_S

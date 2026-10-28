@@ -107,3 +107,16 @@ def test_prediction_view_is_rounded_and_json_safe():
     v = prediction_view(predict(T("me", 0, 0, ve=1.0), T("x", 0, 26, ve=-1.0), M, 30))
     json.dumps(v)
     assert v["with"] == "x" and v["time_to_loss_of_separation_s"] == 10.5
+
+
+def test_intent_track_puts_the_peer_level_at_its_announced_target():
+    from conflict.detection import intent_track_from_peer
+    peer = {"uas_id": "x", "age_s": 0.0, "position": {"north_m": 0, "east_m": 10, "altitude_m": 11},
+            "ground_speed_mps": 1.0, "track_deg": 270.0, "vertical_speed_mps": 1.5,
+            "target_altitude_m": 17.0}
+    t = intent_track_from_peer(peer)
+    assert (t.id, t.altitude_m, t.v_up_mps) == ("x", 17.0, 0.0)
+    assert t.v_east_mps == pytest.approx(-1.0)                       # same horizontal motion
+    assert intent_track_from_peer(dict(peer, target_altitude_m=None)) is None
+    assert intent_track_from_peer(dict(peer, target_altitude_m=11.2)) is None   # already there
+    assert intent_track_from_peer({k: v for k, v in peer.items() if k != "target_altitude_m"}) is None

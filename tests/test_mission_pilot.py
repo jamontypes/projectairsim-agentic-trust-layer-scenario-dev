@@ -84,9 +84,10 @@ def scenario(policies, config=FAST_PILOT):
         m = PLAN.for_vehicle(vid)
         feeds[vid] = ObservationFeed(adapter, vid, recorder=rec)
         rx = bus.attach(RemoteIdReceiver(vid, recorder=rec))
-        tx[vid] = RemoteIdBroadcaster(adapter, vid, bus, recorder=rec)
         runners[vid] = MissionRunner(adapter, m, ex, follower_config=FOLLOW, log=lambda *_: None,
                                      on_event=lambda k, f: rec.record(k, source="mission", **f))
+        tx[vid] = RemoteIdBroadcaster(adapter, vid, bus, recorder=rec,
+                                      intent=runners[vid].target_altitude_m)
         if vid in policies:
             port = ActionPort(vid, runners[vid], feeds[vid], recorder=rec, max_observation_age_s=5.0)
             pilots[vid] = MissionPilot(vid, feeds[vid], port, rx, m, FunctionModel(policies[vid]),
@@ -274,3 +275,33 @@ def test_escapes_follow_the_safe_layer_advice_and_keep_the_margin():
         assert escapes, vid
         others = {10.0, 14.0, 6.0}                          # every planned layer
         assert all(min(abs(a - o) for o in others) >= 3 for a in escapes), (vid, escapes)
+
+
+def test_a_peer_climbing_to_an_announced_layer_is_not_offered_as_safe():
+    """Live 2026-10-28 (run e26cc0): Drone2 left layer 10 for 17; seconds later Drone3
+    (layer 14) chose 17 too, because Drone2 was still reported near 11. With the intent
+    field the target layer counts as occupied and its conflict is predicted."""
+    from conflict.detection import Track, intent_track_from_peer, track_from_peer
+    p = make_pilot()                                    # band 5-20
+    own = Track("Drone3", 16, 0, 14, 0, 0.8, 0)
+    report = {"uas_id": "Drone2", "age_s": 0.3,
+              "position": {"north_m": 13, "east_m": 6, "altitude_m": 11.0},
+              "ground_speed_mps": 0.8, "track_deg": 270.0, "vertical_speed_mps": 0.0}  # just commanded
+    blind = {"own": own, "peers": [track_from_peer(report)]}
+    assert 17.0 in p.safe_layers(blind)                 # the live failure: 17 looked free
+    seen = dict(report, target_altitude_m=17.0)
+    sit = {"own": own, "peers": [track_from_peer(seen), intent_track_from_peer(seen)]}
+    assert all(abs(a - 17.0) >= 3 for a in p.safe_layers(sit))
+    hits = p.what_if_altitude(sit, 17.0)
+    assert [h.other_id for h in hits] == ["Drone2"]     # one prediction per peer, not two
+
+
+def test_live_broadcasts_carry_the_runner_target_layer():
+    results, pilots, rec, truth, adapter = scenario(
+        {"Drone2": LayerPolicy(escape_m=13.0), "Drone3": LayerPolicy(escape_m=17.0)})
+    targets = {}
+    for d in rec.of("rid_transmit"):
+        m = d["payload"]
+        targets.setdefault(m["uas_id"], set()).add(m.get("target_altitude_m"))
+    for vid in PLAN.vehicle_ids:
+        assert PLAN.for_vehicle(vid).corridor.altitude_m in targets.get(vid, set()), vid

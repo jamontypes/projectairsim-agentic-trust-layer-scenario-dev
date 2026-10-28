@@ -152,6 +152,18 @@ def track_from_peer(peer: dict) -> Track:
     return t.advanced(peer.get("age_s") or 0.0)
 
 
+def intent_track_from_peer(peer: dict, min_change_m: float = 0.5) -> Track | None:
+    """The same peer at its ANNOUNCED target altitude (level, same horizontal motion), or
+    None if it announced none or is already there. Planning treats a peer as occupying
+    both its current altitude and its target (live 2026-10-28: two drones picked the
+    same escape layer because each only saw where the other was, not where it was going)."""
+    tgt = peer.get("target_altitude_m")
+    now = track_from_peer(peer)
+    if tgt is None or not now.finite or not math.isfinite(float(tgt))             or abs(float(tgt) - now.altitude_m) < min_change_m:
+        return None
+    return Track(now.id, now.north_m, now.east_m, float(tgt), now.v_north_mps, now.v_east_mps, 0.0)
+
+
 def prediction_view(p: PairPrediction) -> dict:
     """Agent-facing summary of one prediction (rounded)."""
     def r(x, nd=1):

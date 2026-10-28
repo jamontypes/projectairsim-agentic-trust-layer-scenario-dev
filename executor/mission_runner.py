@@ -168,6 +168,15 @@ class MissionRunner:
         self._hold_timer, self._hold_until = None, None
 
     # ------------------------------------------------------------ status
+    def target_altitude_m(self) -> float | None:
+        """The altitude this drone is going to (the Remote ID intent field), or None on the
+        ground / after the mission."""
+        if self.phase == MissionPhase.CLIMBING:
+            return self.mission.corridor.altitude_m
+        if self.phase == MissionPhase.FLYING and self.follower is not None:
+            return self.follower.altitude_target_m
+        return None
+
     def status(self) -> dict:
         """Mission progress (the runner's own bookkeeping, from the flight controller's
         ground-truth position: evaluation / a mission tool, not a sensor reading)."""

@@ -49,8 +49,11 @@ def _hook_name(hook) -> str:
     return getattr(hook, "name", None) or getattr(hook, "__name__", None) or type(hook).__name__
 
 
-def message_from_snapshot(uas_id: str, snap, self_id_text: str = "") -> dict:
-    """The honest broadcast for one simulator snapshot."""
+def message_from_snapshot(uas_id: str, snap, self_id_text: str = "",
+                          target_altitude_m: float | None = None) -> dict:
+    """The honest broadcast for one simulator snapshot. target_altitude_m is an intent
+    extension (not in ASTM F3411; modeled on ADS-B's selected altitude): the layer the
+    drone is going to, so others don't pick it too. Like every field, it is a claim."""
     vn, ve = snap.velocity_ned_mps.x, snap.velocity_ned_mps.y
     gs = math.hypot(vn, ve)
     return {
@@ -63,7 +66,7 @@ def message_from_snapshot(uas_id: str, snap, self_id_text: str = "") -> dict:
         "track_deg": round(math.degrees(math.atan2(ve, vn)) % 360.0, 1) if gs >= 0.3 else None,
         "vertical_speed_mps": round(snap.vertical_speed_mps, 3),
         "self_id_text": self_id_text,
-    }
+    } | ({} if target_altitude_m is None else {"target_altitude_m": round(float(target_altitude_m), 2)})
 
 
 def _apply_hooks(hooks, payloads: list[dict], ctx: RidContext, on_error):
@@ -214,8 +217,9 @@ class RemoteIdBroadcaster:
     """One drone's transmitter. Honest unless given sender hooks (the red team's slot)."""
 
     def __init__(self, adapter, vehicle_id: str, bus: RemoteIdBus, hooks=(), recorder=None,
-                 self_id_text: str = "", uas_id: str | None = None):
+                 self_id_text: str = "", uas_id: str | None = None, intent=None):
         self.vehicle_id = vehicle_id
+        self._intent = intent           # () -> target altitude (m) or None: the intent extension
         self.uas_id = uas_id or vehicle_id
         self.self_id_text = self_id_text
         self.rate_hz: float | None = None
@@ -231,7 +235,13 @@ class RemoteIdBroadcaster:
             self._record("rid_broadcast_error", sequence=self._seq,
                          error=f"{type(err).__name__}: {err}")
             return []
-        clean = message_from_snapshot(self.uas_id, snap, self.self_id_text)
+        target = None
+        if self._intent is not None:
+            try:
+                target = self._intent()
+            except Exception:
+                target = None
+        clean = message_from_snapshot(self.uas_id, snap, self.self_id_text, target)
         ctx = RidContext(sender_id=self.vehicle_id, sequence=self._seq)
         sent, changed = _apply_hooks(self._hooks, [copy.deepcopy(clean)], ctx,
                                      lambda h, e: self._record(
@@ -301,6 +311,7 @@ def traffic_for_model(receiver: RemoteIdReceiver, now_host_s: float, max_age_s: 
             "ground_speed_mps": _r(r.num("ground_speed_mps")),
             "track_deg": _r(r.num("track_deg"), 1),
             "vertical_speed_mps": _r(r.num("vertical_speed_mps")),
+            "target_altitude_m": _r(r.num("target_altitude_m")),
             "unverified_text": None if text is None else text[:max_text_len],
             "trust_assessment": r.assessment.status.value if r.assessment else None,
         })
