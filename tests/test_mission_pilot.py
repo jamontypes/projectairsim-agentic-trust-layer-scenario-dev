@@ -60,13 +60,13 @@ class LayerPolicy:
         elif sit.get("safe_layers_m"):      # follow the advice when given, as the prompt asks
             target = sit["safe_layers_m"][0]
         elif "safe_layers_m" in sit:        # advice given but no layer is safe: timed hold
-            return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
-                "observation_id": oid, "maneuver": "hold", "duration_s": 3.0,
+            return ModelResponse(parts=[ToolCallPart("hold", {
+                "observation_id": oid, "duration_s": 3.0,
                 "reason": f"{head}: no safe layer, hold"})])
         else:
             target = self.escape_m
-        return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
-            "observation_id": oid, "maneuver": "change_altitude", "altitude_m": target,
+        return ModelResponse(parts=[ToolCallPart("change_altitude", {
+            "observation_id": oid, "altitude_m": target,
             "reason": f"{head}: layer {target}"})])
 
 
@@ -136,7 +136,7 @@ def test_llm_drones_resolve_head_on_conflicts_and_return_to_their_layer():
         # return legs, so a drone may legitimately finish its corridor on the escape layer)
         layer = PLAN.for_vehicle(vid).corridor.altitude_m
         backs = [c for c in rec.of("tool_call") if c["vehicle_id"] == vid
-                 and c["name"] == "propose_maneuver" and c["args"].get("altitude_m") == layer
+                 and c["name"] == "change_altitude" and c["args"].get("altitude_m") == layer
                  and c["result"]["feedback"]["code"] == "applied"]
         assert backs, vid
     # No ground-truth separation check here: the fake moves a drone ~0.3 m per follower tick
@@ -160,8 +160,8 @@ def test_without_resolution_the_pairs_lose_separation():
         if any(isinstance(p, ToolReturnPart) for p in messages[-1].parts):
             return ModelResponse(parts=[TextPart("Maintaining.")])
         _, sit = situation_in(messages)
-        return ModelResponse(parts=[ToolCallPart("propose_maneuver", {
-            "observation_id": sit["own_state"]["observation_id"], "maneuver": "maintain",
+        return ModelResponse(parts=[ToolCallPart("maintain", {
+            "observation_id": sit["own_state"]["observation_id"],
             "reason": "carry on"})])
     results, pilots, rec, truth, adapter = scenario({"Drone2": maintain, "Drone3": maintain})
     assert min_sep(truth, "Drone2", "Drone4") < 2.0
@@ -218,18 +218,18 @@ def test_tools_monitor_diff_and_expired_observation_hint():
         seen.extend(res)
         if state["n"] == 1:
             _, sit = situation_in(messages)
+            assert {p["uas_id"] for p in sit["traffic"]["peers"]} <= \
+                set(PLAN.vehicle_ids) - {"Drone2"}                  # traffic is in the wake-up
+            assert sit["mission"]["assigned_layer_m"] == 10.0 and "safe_layers_m" in sit
             return ModelResponse(parts=[
-                ToolCallPart("get_mission", {}), ToolCallPart("get_traffic", {}),
-                ToolCallPart("get_conflicts", {}), ToolCallPart("monitor", {"seconds": 99}),
-                ToolCallPart("propose_maneuver", {"observation_id": "stale-id",
-                                                  "maneuver": "hold", "reason": "test"})])
+                ToolCallPart("get_own_state", {}), ToolCallPart("monitor", {"seconds": 99}),
+                ToolCallPart("hold", {"observation_id": "stale-id", "reason": "test"})])
         return ModelResponse(parts=[TextPart("ok")])
     results, pilots, rec, truth, adapter = scenario({"Drone2": fn})
-    mission, traffic, conflicts, monitor, propose = seen[:5]
-    assert mission["mission"]["assigned_layer_m"] == 10.0
-    assert {p["uas_id"] for p in traffic["traffic"]["peers"]} <= set(PLAN.vehicle_ids) - {"Drone2"}
-    assert "predicted_conflicts" in conflicts
+    own, monitor, propose = seen[:3]
+    assert own["own_state"]["observation_id"]
     assert monitor["waited_s"] == FAST_PILOT.monitor_max_s and "conflicts" in monitor
+    assert "safe_layers_m" in monitor
     assert propose["feedback"]["code"] == "unknown_observation" and "next_step" in propose
     text = json.dumps(seen)
     for leak in ("truth", "true_sender", "clean_payload", "snapshot"):
@@ -270,7 +270,7 @@ def test_escapes_follow_the_safe_layer_advice_and_keep_the_margin():
     for vid in LLM:
         layer = PLAN.for_vehicle(vid).corridor.altitude_m
         escapes = [c["args"]["altitude_m"] for c in rec.of("tool_call")
-                   if c["vehicle_id"] == vid and c["name"] == "propose_maneuver"
+                   if c["vehicle_id"] == vid and c["name"] == "change_altitude"
                    and c["args"].get("altitude_m") not in (None, layer)]
         assert escapes, vid
         others = {10.0, 14.0, 6.0}                          # every planned layer
@@ -344,3 +344,28 @@ def test_wakes_when_a_safe_layer_opens_and_rechecks_sooner_as_the_conflict_nears
     assert p._wake_reason(sit(3.0, [d4], 12.0)) is None                 # recheck at 6 s
     assert p._wake_reason(sit(3.0, [d4], 5.0)) == "conflict_persists"   # closer: 2.5 s
     assert p._wake_reason(sit(3.0, [d4], 20.0)) is None                 # far: full 8 s
+
+
+def test_a_layer_change_that_creates_a_conflict_is_refused_before_it_is_sent():
+    """Live 2026-10-28 (run c38c12): Drone3 decided to return to layer 14 from a picture
+    10 s old; by then Drone5 had turned back onto 14 toward it. The pre-check runs on the
+    situation when the proposal arrives."""
+    from conflict.detection import Track
+    p = make_pilot()
+    own = Track("Drone2", 16, 5, 17, 0, -0.8, 0)              # escaped to 17, westbound
+    d5 = Track("Drone5", 16, -8, 14, 0, 0.8, 0)               # back on layer 14, eastbound
+    sit = {"obs": p._feed.observe(), "own": own, "peers": [d5], "now": 0.0, "conflicts": []}
+    assert [c.other_id for c in p.precheck_altitude(sit, 14.0)] == ["Drone5"]
+    assert p.precheck_altitude(sit, 17.0) == []                # staying is fine
+    sit["conflicts"] = p.what_if_altitude(sit, 14.0)          # already in that conflict:
+    assert p.precheck_altitude(sit, 14.0) == []                # not created by the move
+
+    async def go():
+        async def fixed():
+            return dict(sit, conflicts=[])
+        p.situation = fixed
+        return await p._t_propose({"maneuver": "change_altitude", "observation_id": "x",
+                                   "altitude_m": 14.0, "reason": "back to plan"})
+    out = asyncio.run(go())
+    assert out["code"] == "would_conflict" and out["would_create"][0]["with"] == "Drone5"
+    assert "safe_layers_m" in out and p.maneuvers == []       # nothing reached the port
